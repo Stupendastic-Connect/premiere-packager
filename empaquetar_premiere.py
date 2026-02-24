@@ -92,11 +92,26 @@ def write_prproj(path: Path, xml_bytes: bytes) -> None:
 
 class PrprojGraph:
     """Parsea el XML plano de un .prproj y permite navegar el grafo de objetos
-    mediante ObjectID/ObjectRef y ObjectUID/ObjectURef."""
+    mediante ObjectID/ObjectRef y ObjectUID/ObjectURef.
+
+    Estructura real del XML (todos los objetos son hijos directos de
+    <PremiereData>, enlazados por referencias):
+
+      Sequence
+        → TrackGroups/TrackGroup/Second (ObjectRef) → VideoTrackGroup|AudioTrackGroup
+          → TrackGroup/Tracks/Track (ObjectRef) → VideoClipTrack|AudioClipTrack
+            → ClipTrack/ClipItems/TrackItems/TrackItem (ObjectRef) → VideoClipTrackItem
+              → ClipTrackItem/SubClip (ObjectRef) → SubClip
+                → Clip/Clip (ObjectRef) → VideoClip|AudioClip
+                  → Source (ObjectRef) →
+                      VideoMediaSource → MediaSource/Media (ObjectRef) → Media
+                                           → ActualMediaFilePath (ruta del archivo)
+                      VideoSequenceSource → SequenceSource/Sequence (ObjectURef)
+                                             → Sequence (secuencia anidada, recursion)
+    """
 
     def __init__(self, root: ET.Element):
         self.root = root
-        # Indices para resolver referencias rapido
         self._by_id: dict[str, ET.Element] = {}
         self._by_uid: dict[str, ET.Element] = {}
         for elem in root:
@@ -117,23 +132,7 @@ class PrprojGraph:
         uref = node.get("ObjectURef")
         if uref:
             return self._by_uid.get(uref)
-        # Si el nodo tiene texto que es un ID numerico (patron <Tag>42</Tag>)
-        # intentar resolver como ObjectRef
-        if node.text and node.text.strip().isdigit():
-            return self._by_id.get(node.text.strip())
         return None
-
-    def deref_child(self, parent: ET.Element, child_tag: str) -> ET.Element | None:
-        """Busca un hijo por tag y resuelve su referencia."""
-        child = parent.find(child_tag)
-        if child is None:
-            return None
-        # Si el hijo tiene ObjectRef/ObjectURef como atributo
-        resolved = self.deref(child)
-        if resolved is not None:
-            return resolved
-        # Si no, devolver el hijo tal cual (es un elemento directo, no ref)
-        return child
 
     # --- Secuencias --------------------------------------------------------
 
@@ -150,45 +149,50 @@ class PrprojGraph:
 
     # --- Tracks de una secuencia -------------------------------------------
 
-    def _get_track_group(self, seq: ET.Element, group_index: int) -> ET.Element | None:
-        """Obtiene VideoTrackGroup (0) o AudioTrackGroup (1) de una secuencia."""
+    def _get_all_track_groups(self, seq: ET.Element) -> list[tuple[str, ET.Element]]:
+        """Obtiene todos los track groups de una secuencia.
+        Retorna lista de (tag_del_grupo_resuelto, elemento_resuelto).
+
+        TrackGroups en el XML usa <First> con un UUID de media type (no un
+        indice entero), y <Second ObjectRef="X"> apuntando al track group.
+        """
+        results = []
         track_groups = seq.find("TrackGroups")
         if track_groups is None:
-            return None
+            return results
         for tg in track_groups.findall("TrackGroup"):
-            first = tg.find("First")
-            if first is not None and first.text and first.text.strip() == str(group_index):
-                second = tg.find("Second")
-                return self.deref(second) if second is not None else None
-        return None
+            second = tg.find("Second")
+            if second is not None:
+                resolved = self.deref(second)
+                if resolved is not None:
+                    results.append((resolved.tag, resolved))
+        return results
 
     def _get_tracks(self, track_group: ET.Element) -> list[ET.Element]:
         """Obtiene la lista de tracks resueltos de un TrackGroup."""
         tracks = []
-        tg_inner = track_group.find("TrackGroup")
-        if tg_inner is None:
-            tg_inner = track_group
-        tracks_container = tg_inner.find("Tracks")
-        if tracks_container is None:
-            return tracks
-        for track_ref in tracks_container.findall("Track"):
-            resolved = self.deref(track_ref)
-            if resolved is not None:
-                tracks.append(resolved)
+        # Buscar Tracks dentro de TrackGroup hijo o directamente
+        for tracks_el in track_group.iter("Tracks"):
+            for track_ref in tracks_el.findall("Track"):
+                resolved = self.deref(track_ref)
+                if resolved is not None:
+                    tracks.append(resolved)
+            if tracks:
+                break
         return tracks
 
     def _get_clip_items(self, track: ET.Element) -> list[ET.Element]:
-        """Obtiene los ClipTrackItems de un track."""
+        """Obtiene los ClipTrackItems resueltos de un track.
+
+        Estructura: Track > ClipTrack > ClipItems > TrackItems > TrackItem(ObjectRef)
+        Cada TrackItem referencia un VideoClipTrackItem o AudioClipTrackItem.
+        """
         items = []
-        # Navegar: ClipTrack > ClipItems > TrackItems > TrackItem
-        for path in [
-            "ClipTrack/ClipItems/TrackItems/TrackItem",
-            "ClipItems/TrackItems/TrackItem",
-            "TrackItems/TrackItem",
-        ]:
-            for item_ref in track.findall(path):
+        for track_items_el in track.iter("TrackItems"):
+            for item_ref in track_items_el.findall("TrackItem"):
                 resolved = self.deref(item_ref)
-                items.append(resolved if resolved is not None else item_ref)
+                if resolved is not None:
+                    items.append(resolved)
         return items
 
     # --- Extraccion de medios desde una secuencia --------------------------
@@ -202,138 +206,104 @@ class PrprojGraph:
         return media_paths
 
     def _collect_recursive(
-        self,
-        seq: ET.Element,
-        media_paths: set[str],
-        visited_seqs: set[str],
+        self, seq: ET.Element, media_paths: set[str], visited_seqs: set[str],
     ) -> None:
         seq_uid = self.sequence_uid(seq)
         if seq_uid in visited_seqs:
             return
         visited_seqs.add(seq_uid)
 
-        # Recorrer video tracks (group_index=0) y audio tracks (group_index=1)
-        for group_idx in (0, 1):
-            track_group = self._get_track_group(seq, group_idx)
-            if track_group is None:
-                continue
+        for _tag, track_group in self._get_all_track_groups(seq):
             for track in self._get_tracks(track_group):
                 for clip_item in self._get_clip_items(track):
                     self._extract_from_clip_item(clip_item, media_paths, visited_seqs)
 
     def _extract_from_clip_item(
-        self,
-        clip_item: ET.Element,
-        media_paths: set[str],
-        visited_seqs: set[str],
+        self, clip_item: ET.Element, media_paths: set[str], visited_seqs: set[str],
     ) -> None:
         """Extrae media path o recurre si es secuencia anidada."""
-        # Buscar el SubClip -> Clip -> Source
         source_node = self._find_source(clip_item)
         if source_node is None:
             return
 
-        source_resolved = self.deref(source_node)
-        if source_resolved is None:
-            source_resolved = source_node
-
-        # Caso 1: secuencia anidada (SequenceSource)
-        nested_seq = self._find_nested_sequence(source_resolved)
+        # Caso 1: secuencia anidada
+        nested_seq = self._find_nested_sequence(source_node)
         if nested_seq is not None:
             self._collect_recursive(nested_seq, media_paths, visited_seqs)
             return
 
-        # Caso 2: medio normal (MediaSource -> Media -> ActualMediaFilePath)
-        media_path = self._find_media_path(source_resolved)
+        # Caso 2: medio normal
+        media_path = self._find_media_path(source_node)
         if media_path:
             media_paths.add(media_path)
 
     def _find_source(self, clip_item: ET.Element) -> ET.Element | None:
-        """Navega desde un ClipTrackItem hasta el nodo Source."""
-        # Intentar varias rutas posibles en el XML
-        for search_path in [
-            "ClipTrackItem/SubClip",
-            "SubClip",
-        ]:
-            subclip_ref = clip_item.find(search_path)
-            if subclip_ref is not None:
-                subclip = self.deref(subclip_ref)
-                if subclip is None:
-                    subclip = subclip_ref
-                # SubClip -> Clip -> Source, o directamente Clip -> Source
-                for clip_path in ["Clip", ""]:
-                    base = subclip.find(clip_path) if clip_path else subclip
-                    if base is None:
-                        continue
-                    # Buscar VideoClip/AudioClip resolviendo ref
-                    for clip_tag in ["VideoClip", "AudioClip"]:
-                        clip_ref = base.find(clip_tag)
-                        if clip_ref is not None:
-                            clip_node = self.deref(clip_ref)
-                            if clip_node is None:
-                                clip_node = clip_ref
-                            source = clip_node.find("Clip/Source") or clip_node.find("Source")
-                            if source is not None:
-                                return source
-                    # Intento directo sin VideoClip/AudioClip
-                    source = base.find("Clip/Source") or base.find("Source")
-                    if source is not None:
-                        return source
-        # Fallback: buscar Source directamente en el clip_item
-        source = clip_item.find(".//Source")
-        return source
+        """Navega: ClipTrackItem → SubClip → Clip → VideoClip/AudioClip → Source
+        y resuelve cada referencia. Retorna el Source resuelto (VideoMediaSource,
+        AudioMediaSource, VideoSequenceSource, o AudioSequenceSource)."""
+        # Paso 1: encontrar y resolver SubClip
+        subclip = None
+        for path in ["ClipTrackItem/SubClip", "SubClip"]:
+            ref = clip_item.find(path)
+            if ref is not None:
+                subclip = self.deref(ref) or ref
+                break
+        if subclip is None:
+            return None
+
+        # Paso 2: encontrar y resolver el Clip (VideoClip/AudioClip)
+        # Premiere usa SubClip > Clip > Clip(ObjectRef) o SubClip > Clip(ObjectRef)
+        clip = None
+        for path in ["Clip/Clip", "Clip"]:
+            ref = subclip.find(path)
+            if ref is not None:
+                resolved = self.deref(ref)
+                if resolved is not None:
+                    clip = resolved
+                    break
+        if clip is None:
+            return None
+
+        # Paso 3: encontrar y resolver Source
+        for path in ["Source", "Clip/Source"]:
+            ref = clip.find(path)
+            if ref is not None:
+                resolved = self.deref(ref)
+                if resolved is not None:
+                    return resolved
+        return None
 
     def _find_nested_sequence(self, source_node: ET.Element) -> ET.Element | None:
-        """Si el source apunta a una secuencia anidada, devuelve el Sequence."""
-        # Buscar SequenceSource/Sequence en el nodo o sus hijos
-        for path in [
-            "SequenceSource/Sequence",
-            "SequenceSource",
-            ".//SequenceSource/Sequence",
-            ".//SequenceSource",
-        ]:
+        """Si el source es VideoSequenceSource/AudioSequenceSource, devuelve
+        el Sequence anidado."""
+        # Solo buscar en nodos que sean *SequenceSource
+        if "SequenceSource" not in source_node.tag:
+            return None
+        for path in ["SequenceSource/Sequence", "Sequence"]:
             ref = source_node.find(path)
             if ref is not None:
                 resolved = self.deref(ref)
                 if resolved is not None and resolved.tag == "Sequence":
                     return resolved
-                if ref.tag == "Sequence":
-                    return ref
-                # Si es SequenceSource, buscar hijo Sequence
-                seq_child = ref.find("Sequence")
-                if seq_child is not None:
-                    resolved2 = self.deref(seq_child)
-                    if resolved2 is not None:
-                        return resolved2
         return None
 
     def _find_media_path(self, source_node: ET.Element) -> str | None:
-        """Extrae la ruta del archivo de medios desde un nodo Source resuelto."""
-        # Navegar: source -> MediaSource -> Media -> ActualMediaFilePath
+        """Extrae la ruta del archivo desde un VideoMediaSource/AudioMediaSource.
+        Navega: MediaSource > Media(ObjectRef) > ActualMediaFilePath."""
+        # Buscar referencia a Media
         media_node = None
-
-        # Buscar Media ref a traves de varias rutas
-        for path in [
-            "MediaSource/Media",
-            "Media",
-            ".//MediaSource/Media",
-            ".//Media",
-        ]:
-            media_ref = source_node.find(path)
-            if media_ref is not None:
-                resolved = self.deref(media_ref)
+        for path in ["MediaSource/Media", "Media"]:
+            ref = source_node.find(path)
+            if ref is not None:
+                resolved = self.deref(ref)
                 if resolved is not None:
                     media_node = resolved
-                    break
-                # Tal vez el nodo ya es el Media
-                if media_ref.find("ActualMediaFilePath") is not None:
-                    media_node = media_ref
                     break
 
         if media_node is None:
             return None
 
-        # Filtrar medios sinteticos
+        # Filtrar medios sinteticos (barras, tono, color matte)
         state = media_node.find("ContentAndMetadataState")
         if state is not None and state.text and state.text.strip() == SYNTHETIC_MEDIA_STATE:
             return None
@@ -342,8 +312,8 @@ class PrprojGraph:
         if is_proxy is not None and is_proxy.text and is_proxy.text.strip().lower() == "true":
             return None
 
-        # Extraer ruta, preferir ActualMediaFilePath
-        for tag in ("ActualMediaFilePath", "FilePath", "FileKey"):
+        # Extraer ruta (FileKey es UUID en versiones recientes, no usar como path)
+        for tag in ("ActualMediaFilePath", "FilePath"):
             el = media_node.find(tag)
             if el is not None and el.text and is_absolute_path(el.text.strip()):
                 return el.text.strip()
@@ -357,43 +327,30 @@ class PrprojGraph:
         name = self.sequence_name(seq)
         uid = self.sequence_uid(seq)
 
-        # Contar tracks y clips
         video_tracks = 0
         audio_tracks = 0
         clip_count = 0
 
-        for group_idx, counter_name in [(0, "video"), (1, "audio")]:
-            tg = self._get_track_group(seq, group_idx)
-            if tg is None:
-                continue
-            tracks = self._get_tracks(tg)
-            if counter_name == "video":
-                video_tracks = len(tracks)
-            else:
-                audio_tracks = len(tracks)
+        for tag, track_group in self._get_all_track_groups(seq):
+            tracks = self._get_tracks(track_group)
+            if "Video" in tag:
+                video_tracks += len(tracks)
+            elif "Audio" in tag:
+                audio_tracks += len(tracks)
+            # Contar clips en todos los tracks (video, audio, data)
             for track in tracks:
                 clip_count += len(self._get_clip_items(track))
 
-        # Detectar secuencias anidadas contenidas
-        nested_count = 0
+        # Detectar secuencias anidadas
         nested_uids: set[str] = set()
-        for group_idx in (0, 1):
-            tg = self._get_track_group(seq, group_idx)
-            if tg is None:
-                continue
-            for track in self._get_tracks(tg):
+        for _tag, track_group in self._get_all_track_groups(seq):
+            for track in self._get_tracks(track_group):
                 for clip_item in self._get_clip_items(track):
                     source = self._find_source(clip_item)
                     if source is not None:
-                        resolved = self.deref(source)
-                        if resolved is None:
-                            resolved = source
-                        ns = self._find_nested_sequence(resolved)
+                        ns = self._find_nested_sequence(source)
                         if ns is not None:
-                            ns_uid = self.sequence_uid(ns)
-                            if ns_uid not in nested_uids:
-                                nested_uids.add(ns_uid)
-                                nested_count += 1
+                            nested_uids.add(self.sequence_uid(ns))
 
         return {
             "element": seq,
@@ -402,7 +359,7 @@ class PrprojGraph:
             "video_tracks": video_tracks,
             "audio_tracks": audio_tracks,
             "clip_count": clip_count,
-            "nested_count": nested_count,
+            "nested_count": len(nested_uids),
         }
 
     # --- Grafo de anidamiento -----------------------------------------------
@@ -411,30 +368,20 @@ class PrprojGraph:
         """Construye {parent_uid: {child_uid, ...}} para detectar raices."""
         seq_uids = {self.sequence_uid(s) for s in sequences}
         graph: dict[str, set[str]] = {uid: set() for uid in seq_uids}
-        children: set[str] = set()
 
         for seq in sequences:
             parent_uid = self.sequence_uid(seq)
-            info = self.sequence_info(seq)
-            # Recorrer clips buscando nested sequences
-            for group_idx in (0, 1):
-                tg = self._get_track_group(seq, group_idx)
-                if tg is None:
-                    continue
-                for track in self._get_tracks(tg):
+            for _tag, track_group in self._get_all_track_groups(seq):
+                for track in self._get_tracks(track_group):
                     for clip_item in self._get_clip_items(track):
                         source = self._find_source(clip_item)
                         if source is None:
                             continue
-                        resolved = self.deref(source)
-                        if resolved is None:
-                            resolved = source
-                        ns = self._find_nested_sequence(resolved)
+                        ns = self._find_nested_sequence(source)
                         if ns is not None:
                             child_uid = self.sequence_uid(ns)
                             if child_uid in seq_uids:
                                 graph[parent_uid].add(child_uid)
-                                children.add(child_uid)
 
         return graph
 
@@ -444,7 +391,7 @@ class PrprojGraph:
         """Busca todos los elementos con rutas de medios en el XML completo.
         Usado para reescribir rutas en el .prproj de salida."""
         results = []
-        media_tags = {"ActualMediaFilePath", "MediaFilePath", "FilePath", "FileKey"}
+        media_tags = {"ActualMediaFilePath", "MediaFilePath", "FilePath"}
         for elem in self.root.iter():
             if elem.tag in media_tags and elem.text:
                 text = elem.text.strip()
