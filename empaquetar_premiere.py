@@ -404,6 +404,103 @@ class PrprojGraph:
                     results.append((elem, text))
         return results
 
+    # --- Limpieza del XML: solo secuencia seleccionada ----------------------
+
+    def collect_reachable(self, start_elements: list[ET.Element]) -> tuple[set[str], set[str]]:
+        """BFS desde los elementos iniciales, siguiendo todas las referencias
+        ObjectRef/ObjectURef transitivamente.
+
+        Retorna (set_de_ObjectIDs_necesarios, set_de_ObjectUIDs_necesarios).
+        """
+        needed_ids: set[str] = set()
+        needed_uids: set[str] = set()
+        queue = list(start_elements)
+        visited: set[int] = set()  # python id() de cada elemento
+
+        while queue:
+            elem = queue.pop(0)
+            py_id = id(elem)
+            if py_id in visited:
+                continue
+            visited.add(py_id)
+
+            # Registrar los IDs propios de este elemento
+            oid = elem.get("ObjectID")
+            if oid:
+                needed_ids.add(oid)
+            ouid = elem.get("ObjectUID")
+            if ouid:
+                needed_uids.add(ouid)
+
+            # Escanear todos los descendientes buscando referencias
+            for desc in elem.iter():
+                ref = desc.get("ObjectRef")
+                if ref and ref not in needed_ids:
+                    needed_ids.add(ref)
+                    target = self._by_id.get(ref)
+                    if target is not None and id(target) not in visited:
+                        queue.append(target)
+
+                uref = desc.get("ObjectURef")
+                if uref and uref not in needed_uids:
+                    needed_uids.add(uref)
+                    target = self._by_uid.get(uref)
+                    if target is not None and id(target) not in visited:
+                        queue.append(target)
+
+        return needed_ids, needed_uids
+
+    def trim_to_sequence(self, seq: ET.Element, log: logging.Logger) -> int:
+        """Elimina del XML todos los objetos que no son alcanzables desde la
+        secuencia seleccionada. Simula el comportamiento del Project Manager
+        de Premiere ('Collect Files' para una secuencia).
+
+        Mantiene la infraestructura del proyecto (settings, bins) para que
+        Premiere pueda abrir el archivo sin errores.
+
+        Retorna el numero de elementos eliminados.
+        """
+        # Tags de infraestructura que siempre se mantienen
+        KEEP_TAGS = {
+            "Project", "ProjectSettings", "ScratchDiskSettings",
+            "IngestSettings", "WorkspaceSettings", "DummyCaptureSettings",
+            "DefaultSequenceSettings", "RootProjectItem", "BinProjectItem",
+            "VideoSettings", "AudioSettings",
+            "VideoCompileSettings", "AudioCompileSettings", "CompileSettings",
+            "WorkspaceSettings",
+        }
+
+        # BFS desde la secuencia: encontrar todo lo alcanzable
+        needed_ids, needed_uids = self.collect_reachable([seq])
+
+        # Eliminar elementos top-level no alcanzables
+        to_remove = []
+        for elem in list(self.root):
+            # Infraestructura: siempre se mantiene
+            if elem.tag in KEEP_TAGS:
+                continue
+
+            oid = elem.get("ObjectID")
+            ouid = elem.get("ObjectUID")
+
+            # Si alguno de sus IDs esta en el set de necesarios, mantener
+            if oid and oid in needed_ids:
+                continue
+            if ouid and ouid in needed_uids:
+                continue
+
+            # Elementos sin IDs son estructurales, mantener
+            if not oid and not ouid:
+                continue
+
+            to_remove.append(elem)
+
+        for elem in to_remove:
+            self.root.remove(elem)
+
+        log.info("  XML limpiado: %d objetos eliminados", len(to_remove))
+        return len(to_remove)
+
 
 # ---------------------------------------------------------------------------
 # Sistema de ranking de secuencias
@@ -654,6 +751,8 @@ def package_project(
     graph = PrprojGraph(root)
 
     # --- Determinar medios a copiar ---
+    selected_seq = None  # secuencia elegida (para limpiar el XML)
+
     if mode == "all":
         # Modo legacy: copiar todos los medios del proyecto
         all_media_elems = graph.find_all_media_path_elements()
@@ -702,9 +801,10 @@ def package_project(
                 return stats
 
             log.info("  Secuencia: %s", selected["name"])
+            selected_seq = selected["element"]
 
             # Recolectar medios de la secuencia (+ anidadas)
-            target_paths = graph.collect_media_for_sequence(selected["element"])
+            target_paths = graph.collect_media_for_sequence(selected_seq)
             log.info("  Medios de esta secuencia: %d archivos", len(target_paths))
 
     if not target_paths:
@@ -748,7 +848,30 @@ def package_project(
                 log.error("    [ERROR]    %s: %s", src.name, exc)
                 stats["errors"].append(orig)
 
-    # --- Reescribir TODAS las rutas que coincidan en el XML ---
+    # --- Limpiar XML: solo la secuencia seleccionada y sus dependencias ---
+    if selected_seq is not None:
+        if dry_run:
+            # Calcular cuantos se eliminarian sin modificar el arbol
+            needed_ids, needed_uids = graph.collect_reachable([selected_seq])
+            keep_tags = {
+                "Project", "ProjectSettings", "ScratchDiskSettings",
+                "IngestSettings", "WorkspaceSettings", "DummyCaptureSettings",
+                "DefaultSequenceSettings", "RootProjectItem", "BinProjectItem",
+                "VideoSettings", "AudioSettings",
+                "VideoCompileSettings", "AudioCompileSettings", "CompileSettings",
+            }
+            removable = sum(
+                1 for elem in root
+                if elem.tag not in keep_tags
+                and (elem.get("ObjectID") or elem.get("ObjectUID"))
+                and not (elem.get("ObjectID") and elem.get("ObjectID") in needed_ids)
+                and not (elem.get("ObjectUID") and elem.get("ObjectUID") in needed_uids)
+            )
+            log.info("  [DRY-RUN] Eliminaria %d objetos del XML", removable)
+        else:
+            graph.trim_to_sequence(selected_seq, log)
+
+    # --- Reescribir rutas de medios copiados en el XML ---
     all_media_elems = graph.find_all_media_path_elements()
     for elem, orig in all_media_elems:
         if orig in path_map:
