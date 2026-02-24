@@ -40,6 +40,9 @@ SKIP_PATTERNS = [
     "nested sequence",
 ]
 
+# Secuencias con este numero de clips o menos se consideran nests internos
+MIN_CLIPS_THRESHOLD = 2
+
 # Nombres que bajan la puntuacion (deliverables secundarios / redes)
 DEMOTE_PATTERNS = [
     "reel", "redes", "instagram", "ig", "tiktok", "shorts", "stories",
@@ -246,7 +249,9 @@ class PrprojGraph:
         for path in ["ClipTrackItem/SubClip", "SubClip"]:
             ref = clip_item.find(path)
             if ref is not None:
-                subclip = self.deref(ref) or ref
+                subclip = self.deref(ref)
+                if subclip is None:
+                    subclip = ref
                 break
         if subclip is None:
             return None
@@ -672,10 +677,13 @@ def package_project(
             scored = [(info, score_sequence(info, nesting, infos)) for info in infos]
             ranked = sorted(scored, key=lambda x: x[1], reverse=True)
 
-            # Filtrar secuencias auto-generadas por Premiere (ej: "Secuencia anidada 01")
+            # Filtrar secuencias internas de Premiere:
+            # - Nombre auto-generado ("Secuencia anidada 01")
+            # - Nests internos (<=2 clips, tipico de Premiere al anidar)
             filtered = [
                 (info, sc) for info, sc in ranked
                 if not is_auto_nested_name(info["name"])
+                and info["clip_count"] > MIN_CLIPS_THRESHOLD
             ]
             if filtered:
                 ranked = filtered
