@@ -34,6 +34,12 @@ from pathlib import Path
 
 TICKS_PER_SECOND = 254_016_000_000
 
+# Secuencias auto-generadas por Premiere que se ocultan de la lista
+SKIP_PATTERNS = [
+    "secuencia anidada",
+    "nested sequence",
+]
+
 # Nombres que bajan la puntuacion (deliverables secundarios / redes)
 DEMOTE_PATTERNS = [
     "reel", "redes", "instagram", "ig", "tiktok", "shorts", "stories",
@@ -605,6 +611,15 @@ def select_sequence_auto(
 # Utilidades de rutas
 # ---------------------------------------------------------------------------
 
+def is_auto_nested_name(name: str) -> bool:
+    """Detecta nombres auto-generados por Premiere como 'Secuencia anidada 01'."""
+    lower = name.lower().strip()
+    for pattern in SKIP_PATTERNS:
+        if lower.startswith(pattern):
+            return True
+    return False
+
+
 def is_absolute_path(text: str) -> bool:
     if not text or len(text) < 3:
         return False
@@ -709,6 +724,14 @@ def package_project(
             nesting = graph.build_nesting_graph(sequences)
             scored = [(info, score_sequence(info, nesting, infos)) for info in infos]
             ranked = sorted(scored, key=lambda x: x[1], reverse=True)
+
+            # Filtrar secuencias auto-generadas por Premiere (ej: "Secuencia anidada 01")
+            filtered = [
+                (info, sc) for info, sc in ranked
+                if not is_auto_nested_name(info["name"])
+            ]
+            if filtered:
+                ranked = filtered
 
             # Seleccionar segun modo
             selected = None
