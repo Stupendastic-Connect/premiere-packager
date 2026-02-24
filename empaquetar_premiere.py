@@ -17,16 +17,21 @@ Uso:
     python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --auto
     python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --sequence "*boda*"
     python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --all
+
+Traduccion de rutas Mac a Windows (proyectos creados en Mac, medios en drives Windows):
+    python empaquetar_premiere.py "V:/Proyectos" "E:/Backup" --map "/Volumes/SEGUIMIENTOS=V:" --map "/Volumes/Dropbox=D:/Dropbox"
 """
 
 import argparse
 import fnmatch
 import gzip
 import logging
+import posixpath
+import re
 import shutil
 import sys
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -69,6 +74,54 @@ def setup_logging():
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     return logging.getLogger("empaquetar")
+
+
+# ---------------------------------------------------------------------------
+# Traduccion de rutas Mac -> Windows
+# ---------------------------------------------------------------------------
+
+def parse_path_mappings(map_args: list[str] | None) -> list[tuple[str, str]]:
+    """Parsea los argumentos --map en pares (mac_prefix, windows_prefix).
+    Formato: "/Volumes/SEGUIMIENTOS=V:" """
+    if not map_args:
+        return []
+    mappings = []
+    for entry in map_args:
+        if "=" not in entry:
+            raise ValueError(f"Formato de --map invalido (falta '='): {entry}")
+        mac, win = entry.split("=", 1)
+        # Normalizar: sin trailing slash
+        mac = mac.rstrip("/").rstrip("\\")
+        win = win.rstrip("/").rstrip("\\")
+        mappings.append((mac, win))
+    # Ordenar por longitud descendente (match mas especifico primero)
+    mappings.sort(key=lambda x: len(x[0]), reverse=True)
+    return mappings
+
+
+def translate_path(mac_path: str, mappings: list[tuple[str, str]]) -> str:
+    """Traduce una ruta Mac a Windows usando los mapeos.
+    Si no hay match, devuelve la ruta original."""
+    if not mappings:
+        return mac_path
+    for mac_prefix, win_prefix in mappings:
+        if mac_path.startswith(mac_prefix + "/") or mac_path == mac_prefix:
+            remainder = mac_path[len(mac_prefix):]
+            # Convertir slashes y limpiar /./  /../
+            translated = win_prefix + remainder.replace("/", "\\")
+            # Normalizar . y .. en la ruta
+            return str(Path(translated))
+    return mac_path
+
+
+def normalize_media_path(path_str: str) -> str:
+    """Normaliza rutas con /./  /../ y barras inconsistentes."""
+    # Detectar si es ruta Mac/Unix
+    if path_str.startswith("/"):
+        normalized = posixpath.normpath(path_str)
+        return normalized
+    # Ruta Windows
+    return str(Path(path_str))
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +775,7 @@ def package_project(
     dry_run: bool,
     mode: str,
     sequence_pattern: str | None,
+    path_mappings: list[tuple[str, str]],
     log: logging.Logger,
 ) -> dict:
     """Empaqueta un proyecto .prproj individual."""
@@ -815,17 +869,30 @@ def package_project(
             write_prproj(project_folder / prproj_path.name, modified)
         return stats
 
-    # --- Construir mapa y copiar ---
+    # --- Traducir rutas Mac -> Windows y construir mapa ---
+    # path_map: ruta_original_xml -> ruta_destino_en_media_folder
+    # src_map:  ruta_original_xml -> ruta_real_en_disco (traducida)
     path_map: dict[str, Path] = {}
+    src_map: dict[str, Path] = {}
     for orig in sorted(target_paths):
-        path_map[orig] = media_dest_path(orig, media_folder)
+        normalized = normalize_media_path(orig)
+        translated = translate_path(normalized, path_mappings)
+        src_map[orig] = Path(translated)
+        # La estructura en destino usa la ruta traducida (Windows)
+        path_map[orig] = media_dest_path(translated, media_folder)
+
+    if path_mappings:
+        # Mostrar cuantas rutas se tradujeron
+        translated_count = sum(1 for o in target_paths if str(src_map[o]) != o)
+        if translated_count:
+            log.info("  Rutas traducidas Mac->Win: %d/%d", translated_count, len(target_paths))
 
     for orig in sorted(target_paths):
-        src = Path(orig)
+        src = src_map[orig]
         dst = path_map[orig]
 
         if not src.exists():
-            log.warning("    [OFFLINE]  %s", orig)
+            log.warning("    [OFFLINE]  %s", src)
             stats["missing"] += 1
             continue
 
@@ -846,7 +913,7 @@ def package_project(
                     stats["skipped"] += 1
             except OSError as exc:
                 log.error("    [ERROR]    %s: %s", src.name, exc)
-                stats["errors"].append(orig)
+                stats["errors"].append(str(src))
 
     # --- Limpiar XML: solo la secuencia seleccionada y sus dependencias ---
     if selected_seq is not None:
@@ -901,11 +968,13 @@ def main():
             '  python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --dry-run\n'
             '  python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --auto\n'
             '  python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --sequence "*boda*"\n'
-            '  python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --all'
+            '  python empaquetar_premiere.py "D:/Proyectos" "E:/Backup" --all\n'
+            '  python empaquetar_premiere.py "V:/Proyectos" "E:/Backup" --map "/Volumes/SEG=V:" --dry-run\n'
+            '  python empaquetar_premiere.py "proyecto.prproj" "E:/Backup" --auto'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("origen", type=Path, help="Carpeta con proyectos .prproj")
+    parser.add_argument("origen", type=Path, help="Carpeta con .prproj o archivo .prproj individual")
     parser.add_argument("destino", type=Path, help="Carpeta destino para el backup")
 
     group = parser.add_mutually_exclusive_group()
@@ -931,15 +1000,46 @@ def main():
         action="store_true",
         help="Muestra lo que haria sin copiar nada",
     )
+    parser.add_argument(
+        "--map",
+        action="append",
+        metavar="MAC=WIN",
+        help=(
+            "Traduccion de rutas Mac a Windows. Formato: /Volumes/DISCO=V:\n"
+            "Se puede repetir: --map /Volumes/A=V: --map /Volumes/B=W:"
+        ),
+    )
+    parser.add_argument(
+        "--include-autosave",
+        action="store_true",
+        help="Incluir carpetas 'Adobe Premiere Pro Auto-Save' (omitidas por defecto)",
+    )
 
     args = parser.parse_args()
     log = setup_logging()
 
-    if not args.origen.is_dir():
-        log.error("Carpeta origen no encontrada: %s", args.origen)
+    # Parsear mapeos de rutas
+    path_mappings = parse_path_mappings(args.map)
+
+    # Aceptar un archivo .prproj individual o una carpeta
+    if args.origen.is_file() and args.origen.suffix.lower() == ".prproj":
+        projects = [args.origen]
+    elif args.origen.is_dir():
+        projects = sorted(args.origen.rglob("*.prproj"))
+        # Filtrar Auto-Save por defecto
+        if not args.include_autosave:
+            before = len(projects)
+            projects = [
+                p for p in projects
+                if "Adobe Premiere Pro Auto-Save" not in str(p)
+            ]
+            filtered = before - len(projects)
+            if filtered:
+                log.info("  (Omitidos %d proyectos de Auto-Save)", filtered)
+    else:
+        log.error("Origen no encontrado: %s", args.origen)
         sys.exit(1)
 
-    projects = sorted(args.origen.rglob("*.prproj"))
     if not projects:
         log.warning("No se encontraron .prproj en %s", args.origen)
         sys.exit(0)
@@ -970,6 +1070,10 @@ def main():
     log.info("  Origen:     %s", args.origen)
     log.info("  Destino:    %s", args.destino)
     log.info("  Proyectos:  %d", len(projects))
+    if path_mappings:
+        log.info("  Mapeos Mac->Win:")
+        for mac, win in path_mappings:
+            log.info("    %s  ->  %s", mac, win)
     log.info("")
 
     # Procesar
@@ -982,7 +1086,8 @@ def main():
 
         stats = package_project(
             prproj, args.destino, folder_name,
-            args.dry_run, mode, args.sequence, log,
+            args.dry_run, mode, args.sequence,
+            path_mappings, log,
         )
 
         totals["copied"] += stats["copied"]
