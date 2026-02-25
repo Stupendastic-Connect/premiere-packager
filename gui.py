@@ -482,6 +482,7 @@ class App:
         default_maps = [
             "/Volumes/SEGUIMIENTOS=V:",
             "/Volumes/NAS-Dropbox/DATA/SEGUIMIENTOS=V:",
+            "/Volumes/NAS-Dropbox/DropboxStupendastic 2023=Z:",
             "/Volumes/NAS-Dropbox=Z:",
         ]
         saved_maps = c.get("maps", [])
