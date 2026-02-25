@@ -970,6 +970,54 @@ def package_project(
                 log.error("    [ERROR]    %s: %s", src.name, exc)
                 stats["errors"].append(str(src))
 
+    # --- Mostrar estructura de carpetas del empaquetado ---
+    # Recopilar rutas destino de archivos que se copiaron/copiarian (no offline)
+    dest_dirs: dict[str, int] = {}
+    root_files = 0
+    for orig in sorted(target_paths):
+        src = src_map[orig]
+        if not src.exists() or src.is_dir():
+            continue
+        dst = path_map[orig]
+        try:
+            rel = dst.relative_to(project_folder)
+        except ValueError:
+            continue
+        if rel.parent == Path("."):
+            root_files += 1
+        else:
+            # Registrar la carpeta y todas las intermedias
+            parts = rel.parent.parts
+            for depth in range(len(parts)):
+                key = str(Path(*parts[: depth + 1]))
+                if depth == len(parts) - 1:
+                    dest_dirs[key] = dest_dirs.get(key, 0) + 1
+                else:
+                    dest_dirs.setdefault(key, 0)
+
+    if dest_dirs or root_files:
+        log.info("  Estructura Empaquetado:")
+        log.info("    %s/", folder_name)
+        if root_files:
+            log.info("    |-- %s + %d archivos", prproj_path.name, root_files)
+        else:
+            log.info("    |-- %s", prproj_path.name)
+        shown: set[str] = set()
+        for folder in sorted(dest_dirs):
+            parts = Path(folder).parts
+            # Mostrar carpetas intermedias que no se hayan mostrado
+            for depth in range(len(parts)):
+                partial = str(Path(*parts[: depth + 1]))
+                if partial in shown:
+                    continue
+                shown.add(partial)
+                indent = "    " + "|   " * depth
+                count = dest_dirs.get(partial, 0)
+                if count:
+                    log.info("%s|-- %s/ (%d archivos)", indent, parts[depth], count)
+                else:
+                    log.info("%s|-- %s/", indent, parts[depth])
+
     # --- Limpiar XML: solo la secuencia seleccionada y sus dependencias ---
     if selected_seq is not None:
         if dry_run:
