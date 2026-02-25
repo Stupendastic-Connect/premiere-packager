@@ -479,7 +479,11 @@ class App:
             self.skip_done_var.set(c["skip_done"])
         if c.get("autosave") is not None:
             self.autosave_var.set(c["autosave"])
-        default_maps = ["/Volumes/SEGUIMIENTOS=V:", "/Volumes/NAS-Dropbox=Z:"]
+        default_maps = [
+            "/Volumes/SEGUIMIENTOS=V:",
+            "/Volumes/NAS-Dropbox/DATA/SEGUIMIENTOS=V:",
+            "/Volumes/NAS-Dropbox=Z:",
+        ]
         saved_maps = c.get("maps", [])
         for mp in saved_maps:
             self.map_list.insert(tk.END, mp)
