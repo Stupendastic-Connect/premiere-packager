@@ -964,6 +964,7 @@ def package_project(
         if translated_count:
             log.info("  Rutas traducidas Mac->Win: %d/%d", translated_count, len(target_paths))
 
+    copied_origs: set[str] = set()  # Medios que se copiaron/copiarian
     for orig in sorted(target_paths):
         src = src_map[orig]
         dst = path_map[orig]
@@ -976,6 +977,7 @@ def package_project(
         if src.is_dir():
             continue
 
+        copied_origs.add(orig)
         if dry_run:
             log.info("    [COPIARIA] %s", src.name)
             stats["copied"] += 1
@@ -1081,10 +1083,17 @@ def package_project(
             graph.trim_to_sequence(selected_seq, log)
 
     # --- Reescribir rutas de medios copiados en el XML ---
+    # Solo reescribir archivos que se copiaron (no offline).
+    # Usar rutas relativas al .prproj para que el proyecto sea portable.
     all_media_elems = graph.find_all_media_path_elements()
     for elem, orig in all_media_elems:
-        if orig in path_map:
-            elem.text = str(path_map[orig]).replace("\\", "/")
+        if orig in copied_origs:
+            dst = path_map[orig]
+            try:
+                rel = dst.relative_to(project_folder)
+                elem.text = "./" + str(rel).replace("\\", "/")
+            except ValueError:
+                elem.text = str(dst).replace("\\", "/")
 
     # --- Guardar ---
     if dry_run:
