@@ -30,6 +30,7 @@ import posixpath
 import re
 import shutil
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 
@@ -115,7 +116,10 @@ def translate_path(mac_path: str, mappings: list[tuple[str, str]]) -> str:
 
 
 def normalize_media_path(path_str: str) -> str:
-    """Normaliza rutas con /./  /../ y barras inconsistentes."""
+    """Normaliza rutas con /./  /../ y barras inconsistentes.
+    Tambien aplica NFC Unicode (Mac usa NFD, Windows usa NFC)."""
+    # Mac almacena acentos como NFD (o + combining acute) -> NFC (ó)
+    path_str = unicodedata.normalize("NFC", path_str)
     # Detectar si es ruta Mac/Unix
     if path_str.startswith("/"):
         normalized = posixpath.normpath(path_str)
