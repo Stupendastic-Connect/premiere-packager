@@ -484,6 +484,7 @@ class App:
             "/Volumes/NAS-Dropbox/DATA/SEGUIMIENTOS=V:",
             "/Volumes/NAS-Dropbox/DropboxStupendastic 2023=Z:",
             "/Volumes/NAS-Dropbox=Z:",
+            "/Volumes/Dropbox-Stupendastic=Z:",
         ]
         saved_maps = c.get("maps", [])
         for mp in saved_maps:
