@@ -484,8 +484,9 @@ class App:
             for mp in saved_maps:
                 self.map_list.insert(tk.END, mp)
         else:
-            # Default: mapeo Mac -> Win para /Volumes/SEGUIMIENTOS
+            # Default: mapeos Mac -> Win
             self.map_list.insert(tk.END, "/Volumes/SEGUIMIENTOS=V:")
+            self.map_list.insert(tk.END, "/Volumes/NAS-Dropbox=Z:")
         if c.get("geo"):
             try:
                 self.root.geometry(c["geo"])
