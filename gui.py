@@ -38,30 +38,11 @@ _BACKUP_SUFFIX = re.compile(r"_\d+$")
 
 
 def _pick_best_prproj(group: list[Path]) -> Path:
-    """De una lista de .prproj del mismo proyecto, elige el principal.
-
-    Filtra backups (_1, _22) y carpetas de archivo (Antic, Old...).
-    Si quedan varios, elige el mas reciente.
-    """
-    # 1. Descartar los que estan en carpetas de archivo
-    no_archive = [
-        p for p in group
-        if not any(part.lower() in _ARCHIVE_NAMES for part in p.parts)
-    ]
-    candidates = no_archive or group
-
-    # 2. Descartar backups numerados (_1, _22)
-    no_backup = [
-        p for p in candidates
-        if not _BACKUP_SUFFIX.search(p.stem)
-    ]
-    candidates = no_backup or candidates
-
-    # 3. De los que quedan, el mas reciente
+    """De una lista de .prproj del mismo proyecto, elige el mas reciente."""
     try:
-        return max(candidates, key=lambda p: p.stat().st_mtime)
+        return max(group, key=lambda p: p.stat().st_mtime)
     except OSError:
-        return candidates[0]
+        return group[0]
 
 
 def _find_project_root(prproj: Path) -> Path:
