@@ -28,6 +28,42 @@ LIMIT_N = 10
 # Helpers
 # ---------------------------------------------------------------------------
 
+import re
+
+# Carpetas que se consideran "archivo" y se ignoran al buscar .prproj
+_ARCHIVE_NAMES = {"antic", "old", "backup", "archive", "antiguo", "bak", "prev"}
+
+# Patron para backups de Premiere: nombre_1.prproj, nombre_22.prproj
+_BACKUP_SUFFIX = re.compile(r"_\d+$")
+
+
+def _pick_best_prproj(group: list[Path]) -> Path:
+    """De una lista de .prproj del mismo proyecto, elige el principal.
+
+    Filtra backups (_1, _22) y carpetas de archivo (Antic, Old...).
+    Si quedan varios, elige el mas reciente.
+    """
+    # 1. Descartar los que estan en carpetas de archivo
+    no_archive = [
+        p for p in group
+        if not any(part.lower() in _ARCHIVE_NAMES for part in p.parts)
+    ]
+    candidates = no_archive or group
+
+    # 2. Descartar backups numerados (_1, _22)
+    no_backup = [
+        p for p in candidates
+        if not _BACKUP_SUFFIX.search(p.stem)
+    ]
+    candidates = no_backup or candidates
+
+    # 3. De los que quedan, el mas reciente
+    try:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return candidates[0]
+
+
 def _find_project_root(prproj: Path) -> Path:
     """Sube desde el .prproj hasta encontrar la carpeta del proyecto.
 
@@ -529,7 +565,17 @@ class App:
             found = [p for p in found
                      if "Adobe Premiere Pro Auto-Save" not in str(p)]
 
-        for i, prproj in enumerate(found):
+        # Agrupar por proyecto (project root) y elegir el mejor .prproj
+        from collections import OrderedDict
+        groups: OrderedDict[str, list[Path]] = OrderedDict()
+        for p in found:
+            root = _find_project_root(p)
+            key = str(root)
+            groups.setdefault(key, []).append(p)
+
+        best: list[Path] = [_pick_best_prproj(g) for g in groups.values()]
+
+        for i, prproj in enumerate(best):
             try:
                 rel = str(prproj.relative_to(base))
             except ValueError:
@@ -538,9 +584,11 @@ class App:
             self.tree.insert("", tk.END, iid=str(i),
                               values=(rel, "Listo"), tags=("pending",))
 
-        n = len(found)
+        n = len(best)
+        total = len(found)
+        extra = f" (de {total} archivos)" if total != n else ""
         self.count_var.set(
-            f"{n} proyecto{'s' if n != 1 else ''} encontrado{'s' if n != 1 else ''}")
+            f"{n} proyecto{'s' if n != 1 else ''}{extra}")
         self._update_btn()
         self._update_preview()
 
