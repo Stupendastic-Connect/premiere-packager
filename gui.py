@@ -2,7 +2,7 @@
 """
 gui.py - Interfaz grafica para Premiere Packager.
 
-Flujo:  Carpeta → Nombre salida → Empaquetar
+Flujo:  Carpeta base  ->  Configurar  ->  Empaquetar
 Atajos: Ctrl+Enter = Empaquetar | Escape = Cancelar | Ctrl+L = Limpiar log
 """
 
@@ -20,6 +20,8 @@ CONFIG_PATH = SCRIPT_DIR / ".packager_gui.json"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from empaquetar_premiere import package_project, parse_path_mappings
+
+LIMIT_N = 10
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +79,7 @@ class App:
         self._load()
         self.root.after(100, self.src_entry.focus_set)
 
-    # ── Styles ─────────────────────────────────────────────
+    # ── Styles ────────────────────────────────────────────
 
     def _style(self):
         s = ttk.Style()
@@ -87,13 +89,12 @@ class App:
                 break
 
         s.configure("H1.TLabel", font=("Segoe UI", 14, "bold"))
-        s.configure("Step.TLabel", font=("Segoe UI", 9, "bold"), foreground="#444")
         s.configure("Dim.TLabel", foreground="#777", font=("Segoe UI", 9))
         s.configure("Preview.TLabel", foreground="#555", font=("Consolas", 9))
         s.configure("Run.TButton", font=("Segoe UI", 10, "bold"), padding=(20, 8))
         s.configure("Small.TButton", padding=(6, 2))
 
-    # ── UI ─────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────
 
     def _ui(self):
         m = ttk.Frame(self.root, padding=(16, 12, 16, 10))
@@ -101,21 +102,23 @@ class App:
 
         # ── Header ──
         ttk.Label(m, text="Premiere Packager", style="H1.TLabel").pack(
-            anchor=tk.W, pady=(0, 10)
-        )
+            anchor=tk.W, pady=(0, 10))
 
         # ── Carpeta base ──
         r = ttk.Frame(m)
         r.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(r, text="Carpeta:", style="Step.TLabel", width=8).pack(side=tk.LEFT)
+        ttk.Label(r, text="Carpeta base:", width=12).pack(side=tk.LEFT)
         self.src_var = tk.StringVar()
-        self.src_entry = ttk.Entry(r, textvariable=self.src_var, font=("Segoe UI", 10))
+        self.src_entry = ttk.Entry(r, textvariable=self.src_var,
+                                    font=("Segoe UI", 10))
         self.src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        ttk.Button(r, text="Examinar\u2026", command=self._browse).pack(side=tk.LEFT)
+        ttk.Button(r, text="Examinar\u2026", command=self._browse).pack(
+            side=tk.LEFT)
         self.src_var.trace_add("write", lambda *_: self._schedule_scan())
 
         # ── Proyectos ──
-        tree_frame = ttk.LabelFrame(m, text="  Proyectos  ", padding=(6, 4))
+        tree_frame = ttk.LabelFrame(m, text="  Proyectos encontrados  ",
+                                     padding=(6, 4))
         tree_frame.pack(fill=tk.X, pady=(0, 6))
 
         tf = ttk.Frame(tree_frame)
@@ -142,14 +145,13 @@ class App:
         self.tree.tag_configure("skip", foreground="#e65100")
 
         self.count_var = tk.StringVar()
-        ttk.Label(tree_frame, textvariable=self.count_var, style="Dim.TLabel").pack(
-            anchor=tk.W, pady=(3, 0)
-        )
+        ttk.Label(tree_frame, textvariable=self.count_var,
+                  style="Dim.TLabel").pack(anchor=tk.W, pady=(3, 0))
 
         # ── Nombre salida ──
         r = ttk.Frame(m)
         r.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(r, text="Salida:", style="Step.TLabel", width=8).pack(side=tk.LEFT)
+        ttk.Label(r, text="Carpeta salida:", width=12).pack(side=tk.LEFT)
         self.out_var = tk.StringVar(value="Empaquetado")
         self.out_combo = ttk.Combobox(
             r, textvariable=self.out_var,
@@ -158,9 +160,8 @@ class App:
         )
         self.out_combo.pack(side=tk.LEFT, padx=(0, 10))
         self.preview_var = tk.StringVar()
-        ttk.Label(r, textvariable=self.preview_var, style="Preview.TLabel").pack(
-            side=tk.LEFT
-        )
+        ttk.Label(r, textvariable=self.preview_var,
+                  style="Preview.TLabel").pack(side=tk.LEFT)
         self.out_var.trace_add("write", lambda *_: self._update_preview())
 
         # ── Opciones ──
@@ -168,14 +169,17 @@ class App:
         r.pack(fill=tk.X, pady=(2, 0))
 
         self.dry_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            r, text="Solo previsualizar (Dry Run)", variable=self.dry_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(r, text="Dry Run (no copia, solo muestra)",
+                         variable=self.dry_var).pack(side=tk.LEFT, padx=(0, 16))
+
+        self.limit_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r, text=f"Limite ({LIMIT_N} proyectos)",
+                         variable=self.limit_var).pack(side=tk.LEFT, padx=(0, 16))
+        self.limit_var.trace_add("write", lambda *_: self._update_btn())
 
         self.autosave_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r, text="Incluir Auto-Save", variable=self.autosave_var).pack(
-            side=tk.LEFT, padx=(0, 16)
-        )
+        ttk.Checkbutton(r, text="Incluir Auto-Save",
+                         variable=self.autosave_var).pack(side=tk.LEFT, padx=(0, 16))
         self.autosave_var.trace_add("write", lambda *_: self._schedule_scan())
 
         self._adv_open = False
@@ -185,29 +189,27 @@ class App:
         )
         self._adv_btn.pack(side=tk.LEFT)
 
-        # Contenido avanzado (oculto por defecto)
+        # Mapeos (oculto)
         self._adv_frame = ttk.Frame(m, padding=(8, 4, 0, 0))
         r2 = ttk.Frame(self._adv_frame)
         r2.pack(fill=tk.X, pady=(0, 3))
         ttk.Label(r2, text="Mac:").pack(side=tk.LEFT)
         self.mac_var = tk.StringVar()
         ttk.Entry(r2, textvariable=self.mac_var, width=22).pack(
-            side=tk.LEFT, padx=(4, 8)
-        )
+            side=tk.LEFT, padx=(4, 8))
         ttk.Label(r2, text="Win:").pack(side=tk.LEFT)
         self.win_var = tk.StringVar()
         self._win_entry = ttk.Entry(r2, textvariable=self.win_var, width=22)
         self._win_entry.pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Button(r2, text="+", width=3, command=self._add_map).pack(side=tk.LEFT)
+        ttk.Button(r2, text="+", width=3, command=self._add_map).pack(
+            side=tk.LEFT)
         ttk.Button(r2, text="\u2212", width=3, command=self._rm_map).pack(
-            side=tk.LEFT, padx=(2, 0)
-        )
-        self.map_list = tk.Listbox(
-            self._adv_frame, height=2, font=("Consolas", 9), activestyle="dotbox"
-        )
+            side=tk.LEFT, padx=(2, 0))
+        self.map_list = tk.Listbox(self._adv_frame, height=2,
+                                    font=("Consolas", 9), activestyle="dotbox")
         self.map_list.pack(fill=tk.X)
 
-        # ── Barra de separacion ──
+        # ── Separador ──
         ttk.Separator(m, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(10, 0))
 
         # ── Botones + progreso ──
@@ -215,25 +217,24 @@ class App:
         bf.pack(fill=tk.X, pady=(8, 0))
 
         self.run_btn = ttk.Button(
-            bf, text="\u25b6  EMPAQUETAR", command=self._run, style="Run.TButton",
+            bf, text="\u25b6  EMPAQUETAR", command=self._run,
+            style="Run.TButton",
         )
         self.run_btn.pack(side=tk.LEFT)
 
         self.cancel_btn = ttk.Button(
-            bf, text="\u25a0  Cancelar", command=self._do_cancel, state=tk.DISABLED,
+            bf, text="\u25a0  Cancelar", command=self._do_cancel,
+            state=tk.DISABLED,
         )
         self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
 
-        # Progreso a la derecha
         self.timer_var = tk.StringVar()
-        ttk.Label(bf, textvariable=self.timer_var, style="Dim.TLabel").pack(
-            side=tk.RIGHT, padx=(8, 0)
-        )
+        ttk.Label(bf, textvariable=self.timer_var,
+                  style="Dim.TLabel").pack(side=tk.RIGHT, padx=(8, 0))
         self.progress_label = tk.StringVar()
-        ttk.Label(
-            bf, textvariable=self.progress_label,
-            font=("Segoe UI", 9, "bold"), foreground="#555",
-        ).pack(side=tk.RIGHT)
+        ttk.Label(bf, textvariable=self.progress_label,
+                  font=("Segoe UI", 9, "bold"), foreground="#555").pack(
+            side=tk.RIGHT)
 
         self.pbar = ttk.Progressbar(m, mode="determinate")
         self.pbar.pack(fill=tk.X, pady=(6, 0))
@@ -241,10 +242,10 @@ class App:
         # ── Log ──
         log_header = ttk.Frame(m)
         log_header.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(log_header, text="Log", style="Step.TLabel").pack(side=tk.LEFT)
-        ttk.Button(
-            log_header, text="Limpiar", command=self._log_clear, style="Small.TButton",
-        ).pack(side=tk.RIGHT)
+        ttk.Label(log_header, text="Log", font=("Segoe UI", 9, "bold"),
+                  foreground="#444").pack(side=tk.LEFT)
+        ttk.Button(log_header, text="Limpiar", command=self._log_clear,
+                   style="Small.TButton").pack(side=tk.RIGHT)
 
         log_frame = ttk.Frame(m)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
@@ -263,19 +264,19 @@ class App:
         lsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.log.pack(fill=tk.BOTH, expand=True)
 
-        # Tags de color
-        self.log.tag_configure("head", foreground="#58a6ff", font=("Consolas", 10, "bold"))
+        flog = ("Consolas", 10)
+        self.log.tag_configure("head", foreground="#58a6ff", font=(*flog, "bold"))
         self.log.tag_configure("sep", foreground="#484f58")
         self.log.tag_configure("seq", foreground="#d2a8ff")
         self.log.tag_configure("info", foreground="#8b949e")
         self.log.tag_configure("ok", foreground="#7ee787")
         self.log.tag_configure("warn", foreground="#d29922")
-        self.log.tag_configure("err", foreground="#f85149", font=("Consolas", 10, "bold"))
+        self.log.tag_configure("err", foreground="#f85149", font=(*flog, "bold"))
         self.log.tag_configure("file", foreground="#79c0ff")
         self.log.tag_configure("dim", foreground="#484f58")
-        self.log.tag_configure("done", foreground="#3fb950", font=("Consolas", 10, "bold"))
+        self.log.tag_configure("done", foreground="#3fb950", font=(*flog, "bold"))
 
-    # ── Keys ───────────────────────────────────────────────
+    # ── Keys ──────────────────────────────────────────────
 
     def _keys(self):
         self.root.bind("<Control-Return>", lambda e: self._run())
@@ -285,7 +286,7 @@ class App:
         self._win_entry.bind("<Return>", lambda e: self._add_map())
         self.map_list.bind("<Delete>", lambda e: self._rm_map())
 
-    # ── Config ─────────────────────────────────────────────
+    # ── Config ────────────────────────────────────────────
 
     def _load(self):
         c = _load_cfg()
@@ -295,10 +296,12 @@ class App:
             self.out_var.set(c["out"])
         if c.get("dry") is not None:
             self.dry_var.set(c["dry"])
+        if c.get("limit") is not None:
+            self.limit_var.set(c["limit"])
         if c.get("autosave") is not None:
             self.autosave_var.set(c["autosave"])
-        for m in c.get("maps", []):
-            self.map_list.insert(tk.END, m)
+        for mp in c.get("maps", []):
+            self.map_list.insert(tk.END, mp)
         if c.get("geo"):
             try:
                 self.root.geometry(c["geo"])
@@ -309,18 +312,20 @@ class App:
         maps = [self.map_list.get(i) for i in range(self.map_list.size())]
         _save_cfg({
             "src": self.src_var.get(), "out": self.out_var.get(),
-            "dry": self.dry_var.get(), "autosave": self.autosave_var.get(),
+            "dry": self.dry_var.get(), "limit": self.limit_var.get(),
+            "autosave": self.autosave_var.get(),
             "maps": maps, "geo": self.root.geometry(),
         })
 
-    # ── Browse ─────────────────────────────────────────────
+    # ── Browse ────────────────────────────────────────────
 
     def _browse(self):
-        p = filedialog.askdirectory(title="Carpeta con proyectos de Premiere")
+        p = filedialog.askdirectory(
+            title="Selecciona la carpeta raiz con los proyectos")
         if p:
             self.src_var.set(p)
 
-    # ── Scan ───────────────────────────────────────────────
+    # ── Scan ──────────────────────────────────────────────
 
     def _schedule_scan(self):
         if self._scan_id:
@@ -344,10 +349,8 @@ class App:
 
         if base.is_file() and base.suffix.lower() == ".prproj":
             self.projects.append((base.name, base))
-            self.tree.insert(
-                "", tk.END, iid="0",
-                values=(base.name, "Pendiente"), tags=("pending",),
-            )
+            self.tree.insert("", tk.END, iid="0",
+                              values=(base.name, "Listo"), tags=("pending",))
             self.count_var.set("1 proyecto (archivo individual)")
             self._update_btn()
             self._update_preview()
@@ -367,10 +370,8 @@ class App:
             return
 
         if not self.autosave_var.get():
-            found = [
-                p for p in found
-                if "Adobe Premiere Pro Auto-Save" not in str(p)
-            ]
+            found = [p for p in found
+                     if "Adobe Premiere Pro Auto-Save" not in str(p)]
 
         for i, prproj in enumerate(found):
             try:
@@ -378,19 +379,16 @@ class App:
             except ValueError:
                 rel = prproj.name
             self.projects.append((rel, prproj))
-            self.tree.insert(
-                "", tk.END, iid=str(i),
-                values=(rel, "Pendiente"), tags=("pending",),
-            )
+            self.tree.insert("", tk.END, iid=str(i),
+                              values=(rel, "Listo"), tags=("pending",))
 
         n = len(found)
         self.count_var.set(
-            f"{n} proyecto{'s' if n != 1 else ''} encontrado{'s' if n != 1 else ''}"
-        )
+            f"{n} proyecto{'s' if n != 1 else ''} encontrado{'s' if n != 1 else ''}")
         self._update_btn()
         self._update_preview()
 
-    # ── Preview ────────────────────────────────────────────
+    # ── Preview ───────────────────────────────────────────
 
     def _update_preview(self):
         out = self.out_var.get().strip()
@@ -398,19 +396,13 @@ class App:
             self.preview_var.set("")
             return
         _, prproj = self.projects[0]
-        # project_root = abuelo del .prproj (Proyecto/, no "2. Proyectos/")
         project_root = prproj.parent.parent
-        example_dir = project_root / out
-        src = self.src_var.get().strip().strip('"').strip("'")
-        base = Path(src) if src else project_root.parent
-        try:
-            rel = example_dir.relative_to(base)
-        except (ValueError, OSError):
-            rel = example_dir
         self.preview_var.set(f"Ej: .../{project_root.name}/{out}/")
 
     def _update_btn(self):
         n = len(self.projects)
+        if self.limit_var.get():
+            n = min(n, LIMIT_N)
         if n == 0:
             self.run_btn.configure(text="\u25b6  EMPAQUETAR")
         elif n == 1:
@@ -418,7 +410,7 @@ class App:
         else:
             self.run_btn.configure(text=f"\u25b6  EMPAQUETAR {n} PROYECTOS")
 
-    # ── Advanced ───────────────────────────────────────────
+    # ── Advanced ──────────────────────────────────────────
 
     def _toggle_adv(self):
         if self._adv_open:
@@ -443,7 +435,7 @@ class App:
         if sel:
             self.map_list.delete(sel[0])
 
-    # ── Log ────────────────────────────────────────────────
+    # ── Log ───────────────────────────────────────────────
 
     def _log_write(self, text: str, tag: str = ""):
         self.log.configure(state=tk.NORMAL)
@@ -452,39 +444,31 @@ class App:
         self.log.configure(state=tk.DISABLED)
 
     def _log_auto(self, text: str):
-        """Colorea automaticamente segun contenido."""
         s = text.lstrip()
         tag = ""
 
-        # Exito
         if "[COPIADO]" in text or "[COPIARIA]" in text:
             tag = "ok"
         elif "guardado" in text.lower():
             tag = "done"
-        # Warnings
         elif "[OFFLINE]" in text:
             tag = "warn"
         elif "Omitidos" in text or "no encontrad" in text:
             tag = "warn"
-        # Errores
         elif "[ERROR]" in text or "ERROR" in text:
             tag = "err"
-        # Secuencia
         elif "Auto-seleccionada:" in text or "Secuencia:" in text:
             tag = "seq"
-        # Info de medios
         elif "Medios de esta" in text or "Medios del proyecto" in text:
             tag = "info"
         elif "medios totales" in text or "XML limpiado" in text:
             tag = "info"
         elif "Eliminaria" in text or "GUARDARIA" in text:
             tag = "info"
-        # Rutas
         elif s.startswith("Origen:") or s.startswith("Destino:"):
             tag = "dim"
         elif "Rutas traducidas" in text:
             tag = "dim"
-        # Separadores
         elif s.startswith("==="):
             tag = "head"
         elif s.startswith("---") or s.startswith("\u2500"):
@@ -499,7 +483,7 @@ class App:
         self.log.delete("1.0", tk.END)
         self.log.configure(state=tk.DISABLED)
 
-    # ── Timer ──────────────────────────────────────────────
+    # ── Timer ─────────────────────────────────────────────
 
     def _start_timer(self):
         self._start_time = time.time()
@@ -518,7 +502,7 @@ class App:
             self.root.after_cancel(self._timer_id)
             self._timer_id = None
 
-    # ── Run ────────────────────────────────────────────────
+    # ── Run ───────────────────────────────────────────────
 
     def _run(self):
         if self.running:
@@ -534,8 +518,7 @@ class App:
         out = self.out_var.get().strip()
         if not out:
             messagebox.showwarning(
-                "Nombre vacio", "Escribe un nombre para la carpeta de salida."
-            )
+                "Nombre vacio", "Escribe un nombre para la carpeta de salida.")
             self.out_combo.focus_set()
             return
 
@@ -543,8 +526,7 @@ class App:
         if any(c in invalid for c in out):
             messagebox.showwarning(
                 "Nombre invalido",
-                f"El nombre no puede contener: {' '.join(invalid)}",
-            )
+                f"El nombre no puede contener: {' '.join(invalid)}")
             self.out_combo.focus_set()
             return
 
@@ -552,6 +534,9 @@ class App:
         self._log_clear()
 
         projects = list(self.projects)
+        if self.limit_var.get():
+            projects = projects[:LIMIT_N]
+
         dry = self.dry_var.get()
         raw_maps = [self.map_list.get(i) for i in range(self.map_list.size())]
 
@@ -571,29 +556,36 @@ class App:
         self.progress_label.set(f"0 / {len(projects)}")
         self._start_timer()
 
-        for i in range(len(projects)):
-            self.tree.item(
-                str(i), values=(projects[i][0], "Pendiente"), tags=("pending",)
-            )
+        for i in range(len(self.projects)):
+            tag = "pending"
+            status = "Listo"
+            if self.limit_var.get() and i >= LIMIT_N:
+                tag = "skip"
+                status = "Fuera del limite"
+            self.tree.item(str(i), values=(self.projects[i][0], status),
+                           tags=(tag,))
 
         # Header
-        mode = "PREVISUALIZACION (Dry Run)" if dry else "EMPAQUETADO"
+        mode_label = "DRY RUN (simulacion)" if dry else "EMPAQUETADO"
         n = len(projects)
+        limit_label = f"  (limite: {LIMIT_N})" if self.limit_var.get() else ""
         self._log_write(
-            f"  {mode}  \u2502  {n} proyecto{'s' if n > 1 else ''}  \u2502  Salida: {out}/",
+            f"  {mode_label}  |  {n} proyecto{'s' if n > 1 else ''}{limit_label}  |  Salida: {out}/",
             "head",
         )
         self._log_write("")
 
         threading.Thread(
-            target=self._worker, args=(projects, out, dry, mappings), daemon=True
+            target=self._worker, args=(projects, out, dry, mappings),
+            daemon=True,
         ).start()
 
     def _worker(self, projects, out_name, dry_run, mappings):
         logger = logging.getLogger("premiere_gui")
         logger.setLevel(logging.INFO)
         logger.handlers.clear()
-        handler = _GuiHandler(lambda msg: self.root.after(0, self._log_auto, msg))
+        handler = _GuiHandler(
+            lambda msg: self.root.after(0, self._log_auto, msg))
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
 
@@ -607,18 +599,16 @@ class App:
                     self.root.after(0, self._set_status, j, "Cancelado", "skip")
                 break
 
-            self.root.after(0, self._set_status, i, "Empaquetando\u2026", "active")
+            self.root.after(0, self._set_status, i, "Empaquetando\u2026",
+                            "active")
             self.root.after(0, self._set_progress, i + 1, total)
 
-            # Separador visual por proyecto
-            label = display if len(display) < 50 else f".../{prproj.parent.name}/{prproj.name}"
+            label = (display if len(display) < 50
+                     else f".../{prproj.parent.name}/{prproj.name}")
             bar = "\u2500" * max(1, 52 - len(f"[{i+1}/{total}] {label}"))
             logger.info("[%d/%d] %s %s", i + 1, total, label, bar)
 
             try:
-                # La raiz del proyecto es el abuelo del .prproj
-                # Estructura: Proyecto/2. Proyectos/video.prproj
-                # dest_root = Proyecto/  (no "2. Proyectos/")
                 project_root = prproj.parent.parent
                 stats = package_project(
                     prproj_path=prproj,
@@ -642,7 +632,8 @@ class App:
                 else:
                     parts = []
                     if copied:
-                        parts.append(f"{copied} archivo{'s' if copied != 1 else ''}")
+                        parts.append(
+                            f"{copied} archivo{'s' if copied != 1 else ''}")
                     if missing:
                         parts.append(f"{missing} offline")
                     status = "\u2713 " + (", ".join(parts) if parts else "OK")
@@ -651,7 +642,8 @@ class App:
 
             except Exception as e:
                 logger.error("  ERROR CRITICO: %s", e)
-                self.root.after(0, self._set_status, i, "\u2717 Error critico", "error")
+                self.root.after(0, self._set_status, i,
+                                "\u2717 Error critico", "error")
                 err_count += 1
 
             logger.info("")
@@ -662,18 +654,18 @@ class App:
         def _summary():
             self._stop_timer()
             elapsed = int(time.time() - self._start_time)
-            m, s = divmod(elapsed, 60)
+            mn, s = divmod(elapsed, 60)
 
             self._log_write("\u2500" * 55, "sep")
 
             if err_count == 0 and not self._cancel_flag:
                 self._log_write(
-                    f"  \u2713  Todo listo  \u2502  {ok_count} proyecto{'s' if ok_count != 1 else ''}  \u2502  {m:02d}:{s:02d}",
+                    f"  \u2713  Todo listo  |  {ok_count} proyecto{'s' if ok_count != 1 else ''}  |  {mn:02d}:{s:02d}",
                     "done",
                 )
             else:
                 self._log_write(
-                    f"  Completados: {ok_count}  \u2502  Errores: {err_count}  \u2502  {m:02d}:{s:02d}",
+                    f"  Completados: {ok_count}  |  Errores: {err_count}  |  {mn:02d}:{s:02d}",
                     "warn" if err_count else "head",
                 )
                 if self._cancel_flag:
@@ -681,14 +673,15 @@ class App:
                     self._log_write(f"  Cancelados: {cancelled}", "warn")
 
             if self.dry_var.get():
-                self._log_write("  (Dry-run: no se copio ningun archivo)", "dim")
+                self._log_write(
+                    "  (Dry-run: no se copio ningun archivo)", "dim")
 
             self._log_write("")
 
         self.root.after(0, _summary)
         self.root.after(0, self._done)
 
-    # ── Status ─────────────────────────────────────────────
+    # ── Status ────────────────────────────────────────────
 
     def _set_status(self, idx: int, text: str, tag: str):
         iid = str(idx)
@@ -704,8 +697,7 @@ class App:
         if self.running:
             self._cancel_flag = True
             self._log_write(
-                "  Cancelando\u2026 (terminando proyecto actual)", "warn"
-            )
+                "  Cancelando\u2026 (terminando proyecto actual)", "warn")
 
     def _done(self):
         self.running = False
