@@ -738,8 +738,27 @@ def is_absolute_path(text: str) -> bool:
     return False
 
 
+_NUMBERED_PREFIX = re.compile(r"^\d+[\.\-\s]+\s*")
+
+
+def _clean_folder_name(name: str) -> str:
+    """Quita prefijos numerados: '1. Material' -> 'Material', '2. Projects' -> 'Projects'."""
+    return _NUMBERED_PREFIX.sub("", name) or name
+
+
+def _fmt_size(nbytes: int) -> str:
+    """Formatea bytes a unidad legible: 1.5 GB, 320 MB, 4.2 KB."""
+    if nbytes >= 1 << 30:
+        return f"{nbytes / (1 << 30):.1f} GB"
+    if nbytes >= 1 << 20:
+        return f"{nbytes / (1 << 20):.0f} MB"
+    if nbytes >= 1 << 10:
+        return f"{nbytes / (1 << 10):.0f} KB"
+    return f"{nbytes} B"
+
+
 def media_dest_path(original: str, media_folder: Path) -> Path:
-    """Ruta destino de un medio dentro de Media/."""
+    """Ruta destino de un medio dentro de Otros/."""
     p = Path(original)
     drive = p.drive.replace(":", "")
     if drive:
@@ -813,7 +832,7 @@ def package_project(
     stats = {"copied": 0, "missing": 0, "skipped": 0, "errors": []}
 
     project_folder = dest_root / folder_name
-    media_folder = project_folder / "Media"
+    media_folder = project_folder / "Otros"
 
     log.info("  Origen:  %s", prproj_path)
     log.info("  Destino: %s", project_folder)
@@ -909,7 +928,7 @@ def package_project(
     #
     # Estrategia: si el archivo esta dentro de la carpeta del proyecto,
     # mantener su ruta relativa (misma estructura de carpetas original).
-    # Si es externo (otro disco, otra carpeta), poner en Media/.
+    # Si es externo (otro disco, otra carpeta), poner en Otros/.
     path_map: dict[str, Path] = {}
     src_map: dict[str, Path] = {}
     # dest_root es la raiz real del proyecto (ej: Proyecto/)
@@ -926,15 +945,18 @@ def package_project(
 
         try:
             rel = src_path.relative_to(project_root)
-            path_map[orig] = project_folder / rel
+            # Limpiar prefijos numerados: "1. Material/..." -> "Material/..."
+            clean_parts = [_clean_folder_name(p) for p in rel.parent.parts]
+            clean_rel = Path(*clean_parts, rel.name) if clean_parts else rel
+            path_map[orig] = project_folder / clean_rel
             internal_count += 1
         except ValueError:
-            # Archivo externo al proyecto -> Media/ con estructura por drive
+            # Archivo externo al proyecto -> Otros/ con estructura por drive
             path_map[orig] = media_dest_path(translated, media_folder)
             external_count += 1
 
     if external_count:
-        log.info("  Medios del proyecto: %d | Externos (Media/): %d",
+        log.info("  Medios del proyecto: %d | Externos (Otros/): %d",
                  internal_count, external_count)
 
     if path_mappings:
@@ -971,13 +993,21 @@ def package_project(
                 stats["errors"].append(str(src))
 
     # --- Mostrar estructura de carpetas del empaquetado ---
-    # Recopilar rutas destino de archivos que se copiaron/copiarian (no offline)
-    dest_dirs: dict[str, int] = {}
+    # Recopilar rutas destino con conteo y tamaño por carpeta
+    dir_counts: dict[str, int] = {}
+    dir_sizes: dict[str, int] = {}
     root_files = 0
+    root_size = 0
+    total_size = 0
     for orig in sorted(target_paths):
         src = src_map[orig]
         if not src.exists() or src.is_dir():
             continue
+        try:
+            fsize = src.stat().st_size
+        except OSError:
+            fsize = 0
+        total_size += fsize
         dst = path_map[orig]
         try:
             rel = dst.relative_to(project_folder)
@@ -985,38 +1015,47 @@ def package_project(
             continue
         if rel.parent == Path("."):
             root_files += 1
+            root_size += fsize
         else:
-            # Registrar la carpeta y todas las intermedias
             parts = rel.parent.parts
             for depth in range(len(parts)):
                 key = str(Path(*parts[: depth + 1]))
+                # Conteo solo en la carpeta hoja (donde esta el archivo)
                 if depth == len(parts) - 1:
-                    dest_dirs[key] = dest_dirs.get(key, 0) + 1
+                    dir_counts[key] = dir_counts.get(key, 0) + 1
                 else:
-                    dest_dirs.setdefault(key, 0)
+                    dir_counts.setdefault(key, 0)
+                # Tamaño se acumula en todas las carpetas ancestro
+                dir_sizes[key] = dir_sizes.get(key, 0) + fsize
 
-    if dest_dirs or root_files:
-        log.info("  Estructura Empaquetado:")
+    if dir_counts or root_files:
+        log.info("  Estructura Empaquetado (%s):", _fmt_size(total_size))
         log.info("    %s/", folder_name)
         if root_files:
-            log.info("    |-- %s + %d archivos", prproj_path.name, root_files)
+            log.info("    |-- %s + %d archivos (%s)",
+                     prproj_path.name, root_files, _fmt_size(root_size))
         else:
             log.info("    |-- %s", prproj_path.name)
         shown: set[str] = set()
-        for folder in sorted(dest_dirs):
+        for folder in sorted(dir_counts):
             parts = Path(folder).parts
-            # Mostrar carpetas intermedias que no se hayan mostrado
             for depth in range(len(parts)):
                 partial = str(Path(*parts[: depth + 1]))
                 if partial in shown:
                     continue
                 shown.add(partial)
                 indent = "    " + "|   " * depth
-                count = dest_dirs.get(partial, 0)
+                count = dir_counts.get(partial, 0)
+                size = dir_sizes.get(partial, 0)
+                size_str = _fmt_size(size) if size else ""
                 if count:
-                    log.info("%s|-- %s/ (%d archivos)", indent, parts[depth], count)
+                    log.info("%s|-- %s/ (%d archivos, %s)",
+                             indent, parts[depth], count, size_str)
                 else:
-                    log.info("%s|-- %s/", indent, parts[depth])
+                    if size_str:
+                        log.info("%s|-- %s/ (%s)", indent, parts[depth], size_str)
+                    else:
+                        log.info("%s|-- %s/", indent, parts[depth])
 
     # --- Limpiar XML: solo la secuencia seleccionada y sus dependencias ---
     if selected_seq is not None:
