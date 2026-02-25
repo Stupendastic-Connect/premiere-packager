@@ -870,19 +870,40 @@ def package_project(
         return stats
 
     # --- Traducir rutas Mac -> Windows y construir mapa ---
-    # path_map: ruta_original_xml -> ruta_destino_en_media_folder
+    # path_map: ruta_original_xml -> ruta_destino
     # src_map:  ruta_original_xml -> ruta_real_en_disco (traducida)
+    #
+    # Estrategia: si el archivo esta dentro de la carpeta del proyecto,
+    # mantener su ruta relativa (misma estructura de carpetas original).
+    # Si es externo (otro disco, otra carpeta), poner en Media/.
     path_map: dict[str, Path] = {}
     src_map: dict[str, Path] = {}
+    # dest_root es la raiz real del proyecto (ej: Proyecto/)
+    # no prproj_path.parent (que puede ser Proyecto/2. Proyectos/)
+    project_root = dest_root
+    internal_count = 0
+    external_count = 0
+
     for orig in sorted(target_paths):
         normalized = normalize_media_path(orig)
         translated = translate_path(normalized, path_mappings)
-        src_map[orig] = Path(translated)
-        # La estructura en destino usa la ruta traducida (Windows)
-        path_map[orig] = media_dest_path(translated, media_folder)
+        src_path = Path(translated)
+        src_map[orig] = src_path
+
+        try:
+            rel = src_path.relative_to(project_root)
+            path_map[orig] = project_folder / rel
+            internal_count += 1
+        except ValueError:
+            # Archivo externo al proyecto -> Media/ con estructura por drive
+            path_map[orig] = media_dest_path(translated, media_folder)
+            external_count += 1
+
+    if external_count:
+        log.info("  Medios del proyecto: %d | Externos (Media/): %d",
+                 internal_count, external_count)
 
     if path_mappings:
-        # Mostrar cuantas rutas se tradujeron
         translated_count = sum(1 for o in target_paths if str(src_map[o]) != o)
         if translated_count:
             log.info("  Rutas traducidas Mac->Win: %d/%d", translated_count, len(target_paths))
