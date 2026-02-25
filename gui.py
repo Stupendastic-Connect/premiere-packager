@@ -559,7 +559,10 @@ class App:
         # Lanzar escaneo en hilo para no bloquear la UI
         self._scanning = True
         self._scan_cancel = False
+        self.pbar.configure(mode="indeterminate")
+        self.pbar.start(15)
         self.count_var.set("Buscando proyectos\u2026")
+        self.progress_label.set("Escaneando\u2026")
         self._update_btn()
         threading.Thread(
             target=self._scan_worker,
@@ -578,21 +581,32 @@ class App:
                 if not include_autosave and "Adobe Premiere Pro Auto-Save" in str(p):
                     continue
                 found.append(p)
-                if len(found) % 50 == 0:
+                if len(found) % 20 == 0:
                     n = len(found)
-                    self.root.after(0, self.count_var.set,
-                                    f"Buscando proyectos\u2026 {n} encontrados")
+                    self.root.after(0, self._scan_progress, n)
         except OSError:
             self.root.after(0, self._scan_finish, base, [])
             return
         found.sort()
         self.root.after(0, self._scan_finish, base, found)
 
+    def _scan_progress(self, n: int):
+        """Actualiza UI con progreso del escaneo (llamado en hilo principal)."""
+        if self._scan_cancel:
+            return
+        self.count_var.set(f"Buscando proyectos\u2026 {n} archivos .prproj")
+        self.progress_label.set(f"{n} encontrados")
+
     def _scan_finish(self, base: Path, found: list[Path]):
         """Callback en hilo principal: agrupa, filtra y muestra resultados."""
+        self.pbar.stop()
+        self.pbar.configure(mode="determinate", value=0)
+        self.progress_label.set("")
         self._scanning = False
         if self._scan_cancel:
             return
+
+        self.count_var.set("Agrupando proyectos\u2026")
 
         # Agrupar por proyecto (project root) y elegir el mejor .prproj
         from collections import OrderedDict
