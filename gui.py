@@ -67,9 +67,10 @@ def _pick_best_prproj(group: list[Path]) -> Path:
 def _find_project_root(prproj: Path) -> Path:
     """Sube desde el .prproj hasta encontrar la carpeta del proyecto.
 
-    La carpeta del proyecto es la que contiene subcarpetas numeradas
-    como '1. Material', '2. Projects', etc.  Si no encuentra el patron
-    devuelve el padre del .prproj como fallback.
+    La carpeta del proyecto es la que contiene una subcarpeta que
+    empieza por '1.' (ej. '1. Material').  Esto la distingue de
+    carpetas intermedias como '2. Projects' que solo tiene hijos
+    '2. Premiere', '2. After Effects', etc.
     """
     current = prproj.parent
     for _ in range(5):
@@ -77,14 +78,13 @@ def _find_project_root(prproj: Path) -> Path:
         if parent == current:
             break
         try:
-            has_numbered = any(
-                c.is_dir() and len(c.name) > 2
-                and c.name[0].isdigit() and c.name[1] in ". "
+            has_first = any(
+                c.is_dir() and c.name[:2] in ("1.", "1 ")
                 for c in parent.iterdir()
             )
         except OSError:
             break
-        if has_numbered:
+        if has_first:
             return parent
         current = parent
     return prproj.parent
@@ -342,7 +342,7 @@ class App:
         self.preview_var = tk.StringVar()
         ttk.Label(r, textvariable=self.preview_var,
                   style="Preview.TLabel").pack(side=tk.LEFT)
-        self.out_var.trace_add("write", lambda *_: self._update_preview())
+        self.out_var.trace_add("write", lambda *_: (self._update_preview(), self._schedule_scan()))
 
         # ── Opciones ──
         r = ttk.Frame(m)
@@ -365,6 +365,12 @@ class App:
         # ── Opciones linea 2 ──
         r2 = ttk.Frame(m)
         r2.pack(fill=tk.X, pady=(2, 0))
+
+        self.skip_done_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r2, text="Omitir ya empaquetados",
+                         variable=self.skip_done_var).pack(
+            side=tk.LEFT, padx=(0, 16))
+        self.skip_done_var.trace_add("write", lambda *_: self._schedule_scan())
 
         self.autosave_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(r2, text="Incluir Auto-Save",
@@ -489,6 +495,8 @@ class App:
             self.limit_var.set(c["limit"])
         if c.get("auto_seq") is not None:
             self.auto_seq_var.set(c["auto_seq"])
+        if c.get("skip_done") is not None:
+            self.skip_done_var.set(c["skip_done"])
         if c.get("autosave") is not None:
             self.autosave_var.set(c["autosave"])
         for mp in c.get("maps", []):
@@ -504,7 +512,7 @@ class App:
         _save_cfg({
             "src": self.src_var.get(), "out": self.out_var.get(),
             "dry": self.dry_var.get(), "limit": self.limit_var.get(),
-            "auto_seq": self.auto_seq_var.get(),
+            "auto_seq": self.auto_seq_var.get(), "skip_done": self.skip_done_var.get(),
             "autosave": self.autosave_var.get(),
             "maps": maps, "geo": self.root.geometry(),
         })
@@ -575,6 +583,20 @@ class App:
 
         best: list[Path] = [_pick_best_prproj(g) for g in groups.values()]
 
+        # Filtrar proyectos ya empaquetados
+        skipped_done = 0
+        if self.skip_done_var.get():
+            out_name = self.out_var.get().strip()
+            if out_name:
+                filtered = []
+                for p in best:
+                    root = _find_project_root(p)
+                    if (root / out_name).is_dir():
+                        skipped_done += 1
+                    else:
+                        filtered.append(p)
+                best = filtered
+
         for i, prproj in enumerate(best):
             try:
                 rel = str(prproj.relative_to(base))
@@ -586,7 +608,12 @@ class App:
 
         n = len(best)
         total = len(found)
-        extra = f" (de {total} archivos)" if total != n else ""
+        parts = []
+        if total != n + skipped_done:
+            parts.append(f"de {total} archivos")
+        if skipped_done:
+            parts.append(f"{skipped_done} ya empaquetado{'s' if skipped_done != 1 else ''}")
+        extra = f" ({', '.join(parts)})" if parts else ""
         self.count_var.set(
             f"{n} proyecto{'s' if n != 1 else ''}{extra}")
         self._update_btn()
