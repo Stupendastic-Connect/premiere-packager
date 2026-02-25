@@ -224,6 +224,8 @@ class App:
         self.running = False
         self._cancel_flag = False
         self._scan_id: str | None = None
+        self._scanning = False
+        self._scan_cancel = False
         self._timer_id: str | None = None
         self._start_time: float = 0
 
@@ -521,6 +523,7 @@ class App:
     def _schedule_scan(self):
         if self._scan_id:
             self.root.after_cancel(self._scan_id)
+        self._scan_cancel = True  # Cancel any running scan thread
         self._scan_id = self.root.after(400, self._scan)
 
     def _scan(self):
@@ -553,16 +556,43 @@ class App:
             self._update_preview()
             return
 
-        try:
-            found = sorted(base.rglob("*.prproj"))
-        except OSError:
-            self.count_var.set("Error al leer la carpeta")
-            self._update_btn()
-            return
+        # Lanzar escaneo en hilo para no bloquear la UI
+        self._scanning = True
+        self._scan_cancel = False
+        self.count_var.set("Buscando proyectos\u2026")
+        self._update_btn()
+        threading.Thread(
+            target=self._scan_worker,
+            args=(base,),
+            daemon=True,
+        ).start()
 
-        if not self.autosave_var.get():
-            found = [p for p in found
-                     if "Adobe Premiere Pro Auto-Save" not in str(p)]
+    def _scan_worker(self, base: Path):
+        """Hilo que escanea .prproj y notifica a la UI progresivamente."""
+        found: list[Path] = []
+        include_autosave = self.autosave_var.get()
+        try:
+            for p in base.rglob("*.prproj"):
+                if self._scan_cancel:
+                    return
+                if not include_autosave and "Adobe Premiere Pro Auto-Save" in str(p):
+                    continue
+                found.append(p)
+                if len(found) % 50 == 0:
+                    n = len(found)
+                    self.root.after(0, self.count_var.set,
+                                    f"Buscando proyectos\u2026 {n} encontrados")
+        except OSError:
+            self.root.after(0, self._scan_finish, base, [])
+            return
+        found.sort()
+        self.root.after(0, self._scan_finish, base, found)
+
+    def _scan_finish(self, base: Path, found: list[Path]):
+        """Callback en hilo principal: agrupa, filtra y muestra resultados."""
+        self._scanning = False
+        if self._scan_cancel:
+            return
 
         # Agrupar por proyecto (project root) y elegir el mejor .prproj
         from collections import OrderedDict
@@ -587,6 +617,10 @@ class App:
                     else:
                         filtered.append(p)
                 best = filtered
+
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self.projects.clear()
 
         for i, prproj in enumerate(best):
             try:
@@ -625,12 +659,18 @@ class App:
         n = len(self.projects)
         if self.limit_var.get():
             n = min(n, LIMIT_N)
-        if n == 0:
+        if self._scanning:
             self.run_btn.configure(text="\u25b6  EMPAQUETAR")
+            self.run_btn.state(["disabled"])
+        elif n == 0:
+            self.run_btn.configure(text="\u25b6  EMPAQUETAR")
+            self.run_btn.state(["disabled"])
         elif n == 1:
             self.run_btn.configure(text="\u25b6  EMPAQUETAR 1 PROYECTO")
+            self.run_btn.state(["!disabled"])
         else:
             self.run_btn.configure(text=f"\u25b6  EMPAQUETAR {n} PROYECTOS")
+            self.run_btn.state(["!disabled"])
 
     # ── Sequence picker (thread-safe) ─────────────────────
 
