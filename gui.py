@@ -479,14 +479,13 @@ class App:
             self.skip_done_var.set(c["skip_done"])
         if c.get("autosave") is not None:
             self.autosave_var.set(c["autosave"])
+        default_maps = ["/Volumes/SEGUIMIENTOS=V:", "/Volumes/NAS-Dropbox=Z:"]
         saved_maps = c.get("maps", [])
-        if saved_maps:
-            for mp in saved_maps:
-                self.map_list.insert(tk.END, mp)
-        else:
-            # Default: mapeos Mac -> Win
-            self.map_list.insert(tk.END, "/Volumes/SEGUIMIENTOS=V:")
-            self.map_list.insert(tk.END, "/Volumes/NAS-Dropbox=Z:")
+        for mp in saved_maps:
+            self.map_list.insert(tk.END, mp)
+        for dm in default_maps:
+            if dm not in saved_maps:
+                self.map_list.insert(tk.END, dm)
         if c.get("geo"):
             try:
                 self.root.geometry(c["geo"])
