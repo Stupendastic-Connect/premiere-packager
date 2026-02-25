@@ -48,26 +48,25 @@ def _pick_best_prproj(group: list[Path]) -> Path:
 def _find_project_root(prproj: Path) -> Path:
     """Sube desde el .prproj hasta encontrar la carpeta del proyecto.
 
-    La carpeta del proyecto es la que contiene una subcarpeta que
-    empieza por '1.' (ej. '1. Material').  Esto la distingue de
-    carpetas intermedias como '2. Projects' que solo tiene hijos
-    '2. Premiere', '2. After Effects', etc.
+    Busca la carpeta numerada mas alta en el arbol (ej. '2. Projects')
+    y devuelve su padre.  Estructura tipica:
+        Villa Rosita / 2. Projects / 2. Premiere / archivo.prproj
+        Villa Rosita / 2. Projects / archivo.prproj
+    En ambos casos devuelve Villa Rosita.
     """
+    topmost_numbered = None
     current = prproj.parent
     for _ in range(5):
-        parent = current.parent
-        if parent == current:
+        if current == current.parent:
             break
-        try:
-            has_first = any(
-                c.is_dir() and c.name[:2] in ("1.", "1 ")
-                for c in parent.iterdir()
-            )
-        except OSError:
-            break
-        if has_first:
-            return parent
-        current = parent
+        if (len(current.name) > 2
+                and current.name[0].isdigit()
+                and current.name[1] in ". "):
+            topmost_numbered = current
+        current = current.parent
+
+    if topmost_numbered is not None:
+        return topmost_numbered.parent
     return prproj.parent
 
 
