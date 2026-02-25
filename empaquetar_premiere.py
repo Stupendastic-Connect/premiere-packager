@@ -768,6 +768,32 @@ def unique_folder_name(base_name: str, used: set[str]) -> str:
 # Empaquetado de un proyecto
 # ---------------------------------------------------------------------------
 
+def list_sequences(prproj_path: Path) -> list[tuple[dict, float]]:
+    """Return ranked list of (info, score) for sequences in a .prproj file.
+
+    Useful for GUI sequence pickers.  Each *info* dict has keys:
+    name, uid, clip_count, video_tracks, audio_tracks, nested_count, element.
+    """
+    xml_bytes = read_prproj(prproj_path)
+    root = ET.fromstring(xml_bytes)
+    graph = PrprojGraph(root)
+    sequences = graph.find_sequences()
+    if not sequences:
+        return []
+
+    infos = [graph.sequence_info(s) for s in sequences]
+    nesting = graph.build_nesting_graph(sequences)
+    scored = [(info, score_sequence(info, nesting, infos)) for info in infos]
+    ranked = sorted(scored, key=lambda x: x[1], reverse=True)
+
+    filtered = [
+        (info, sc) for info, sc in ranked
+        if not is_auto_nested_name(info["name"])
+        and info["clip_count"] > MIN_CLIPS_THRESHOLD
+    ]
+    return filtered if filtered else ranked
+
+
 def package_project(
     prproj_path: Path,
     dest_root: Path,
@@ -777,6 +803,7 @@ def package_project(
     sequence_pattern: str | None,
     path_mappings: list[tuple[str, str]],
     log: logging.Logger,
+    sequence_callback=None,
 ) -> dict:
     """Empaqueta un proyecto .prproj individual."""
     stats = {"copied": 0, "missing": 0, "skipped": 0, "errors": []}
@@ -843,7 +870,10 @@ def package_project(
 
             # Seleccionar segun modo
             selected = None
-            if mode == "auto":
+            if sequence_callback is not None:
+                # GUI callback: recibe ranked, devuelve info dict o None
+                selected = sequence_callback(ranked)
+            elif mode == "auto":
                 selected = select_sequence_auto(ranked, log)
             elif mode == "pattern":
                 selected = select_sequence_by_pattern(ranked, sequence_pattern, log)

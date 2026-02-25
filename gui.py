@@ -25,6 +25,36 @@ LIMIT_N = 10
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_project_root(prproj: Path) -> Path:
+    """Sube desde el .prproj hasta encontrar la carpeta del proyecto.
+
+    La carpeta del proyecto es la que contiene subcarpetas numeradas
+    como '1. Material', '2. Projects', etc.  Si no encuentra el patron
+    devuelve el padre del .prproj como fallback.
+    """
+    current = prproj.parent
+    for _ in range(5):
+        parent = current.parent
+        if parent == current:
+            break
+        try:
+            has_numbered = any(
+                c.is_dir() and len(c.name) > 2
+                and c.name[0].isdigit() and c.name[1] in ". "
+                for c in parent.iterdir()
+            )
+        except OSError:
+            break
+        if has_numbered:
+            return parent
+        current = parent
+    return prproj.parent
+
+
+# ---------------------------------------------------------------------------
 # Persistencia
 # ---------------------------------------------------------------------------
 
@@ -40,6 +70,114 @@ def _save_cfg(cfg: dict):
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Dialogo selector de secuencia
+# ---------------------------------------------------------------------------
+
+class SequencePickerDialog(tk.Toplevel):
+    """Popup para elegir secuencia de un proyecto."""
+
+    def __init__(self, parent, prproj_name: str,
+                 ranked: list[tuple[dict, float]]):
+        super().__init__(parent)
+        self.result: dict | None = None
+        self.ranked = ranked
+        self.transient(parent)
+        self.grab_set()
+        self.title(f"Elegir secuencia - {prproj_name}")
+        self.resizable(True, True)
+
+        # ── UI ──
+        f = ttk.Frame(self, padding=(12, 10))
+        f.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(f, text="Selecciona la secuencia a empaquetar:",
+                  font=("Segoe UI", 10)).pack(anchor=tk.W, pady=(0, 6))
+
+        # Treeview con columnas
+        cols = ("name", "clips", "tracks", "nested", "score")
+        tf = ttk.Frame(f)
+        tf.pack(fill=tk.BOTH, expand=True)
+
+        self.tree = ttk.Treeview(
+            tf, columns=cols, show="headings",
+            height=min(len(ranked), 12), selectmode="browse",
+        )
+        self.tree.heading("name", text="Nombre", anchor=tk.W)
+        self.tree.heading("clips", text="Clips", anchor=tk.E)
+        self.tree.heading("tracks", text="Pistas", anchor=tk.E)
+        self.tree.heading("nested", text="Anidadas", anchor=tk.E)
+        self.tree.heading("score", text="Score", anchor=tk.E)
+        self.tree.column("name", width=280, minwidth=120)
+        self.tree.column("clips", width=60, minwidth=40, anchor=tk.E)
+        self.tree.column("tracks", width=60, minwidth=40, anchor=tk.E)
+        self.tree.column("nested", width=70, minwidth=40, anchor=tk.E)
+        self.tree.column("score", width=60, minwidth=40, anchor=tk.E)
+
+        sb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for i, (info, sc) in enumerate(ranked):
+            total_tracks = info["video_tracks"] + info["audio_tracks"]
+            self.tree.insert(
+                "", tk.END, iid=str(i),
+                values=(info["name"], info["clip_count"], total_tracks,
+                        info["nested_count"], f"{sc:.2f}"),
+            )
+
+        # Seleccionar la primera (mejor score)
+        if ranked:
+            self.tree.selection_set("0")
+            self.tree.focus("0")
+
+        # Botones
+        bf = ttk.Frame(f)
+        bf.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(bf, text="Seleccionar", command=self._ok).pack(
+            side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="Saltar proyecto", command=self._skip).pack(
+            side=tk.LEFT)
+
+        # Hint
+        ttk.Label(bf, text="Doble-click o Enter para seleccionar",
+                  foreground="#777", font=("Segoe UI", 8)).pack(
+            side=tk.RIGHT)
+
+        # Bindings
+        self.tree.bind("<Double-1>", lambda e: self._ok())
+        self.tree.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._skip())
+
+        # Centrar sobre parent
+        self.update_idletasks()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        px = parent.winfo_x()
+        py = parent.winfo_y()
+        w = max(self.winfo_reqwidth(), 580)
+        h = max(self.winfo_reqheight(), 300)
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        self.tree.focus_set()
+
+    def _ok(self):
+        sel = self.tree.selection()
+        if sel:
+            idx = int(sel[0])
+            self.result = self.ranked[idx][0]
+        self.grab_release()
+        self.destroy()
+
+    def _skip(self):
+        self.result = None
+        self.grab_release()
+        self.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +210,12 @@ class App:
         self._scan_id: str | None = None
         self._timer_id: str | None = None
         self._start_time: float = 0
+
+        # Sincronizacion para dialogo de secuencia desde worker thread
+        self._seq_event = threading.Event()
+        self._seq_ranked: list = []
+        self._seq_prproj_name: str = ""
+        self._seq_result: dict | None = None
 
         self._style()
         self._ui()
@@ -177,33 +321,42 @@ class App:
                          variable=self.limit_var).pack(side=tk.LEFT, padx=(0, 16))
         self.limit_var.trace_add("write", lambda *_: self._update_btn())
 
+        self.auto_seq_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r, text="Auto-seleccionar secuencia",
+                         variable=self.auto_seq_var).pack(
+            side=tk.LEFT, padx=(0, 16))
+
+        # ── Opciones linea 2 ──
+        r2 = ttk.Frame(m)
+        r2.pack(fill=tk.X, pady=(2, 0))
+
         self.autosave_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r, text="Incluir Auto-Save",
+        ttk.Checkbutton(r2, text="Incluir Auto-Save",
                          variable=self.autosave_var).pack(side=tk.LEFT, padx=(0, 16))
         self.autosave_var.trace_add("write", lambda *_: self._schedule_scan())
 
         self._adv_open = False
         self._adv_btn = ttk.Button(
-            r, text="\u25b8 Mapeos Mac\u2192Win",
+            r2, text="\u25b8 Mapeos Mac\u2192Win",
             command=self._toggle_adv, style="Small.TButton",
         )
         self._adv_btn.pack(side=tk.LEFT)
 
         # Mapeos (oculto)
         self._adv_frame = ttk.Frame(m, padding=(8, 4, 0, 0))
-        r2 = ttk.Frame(self._adv_frame)
-        r2.pack(fill=tk.X, pady=(0, 3))
-        ttk.Label(r2, text="Mac:").pack(side=tk.LEFT)
+        r3 = ttk.Frame(self._adv_frame)
+        r3.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(r3, text="Mac:").pack(side=tk.LEFT)
         self.mac_var = tk.StringVar()
-        ttk.Entry(r2, textvariable=self.mac_var, width=22).pack(
+        ttk.Entry(r3, textvariable=self.mac_var, width=22).pack(
             side=tk.LEFT, padx=(4, 8))
-        ttk.Label(r2, text="Win:").pack(side=tk.LEFT)
+        ttk.Label(r3, text="Win:").pack(side=tk.LEFT)
         self.win_var = tk.StringVar()
-        self._win_entry = ttk.Entry(r2, textvariable=self.win_var, width=22)
+        self._win_entry = ttk.Entry(r3, textvariable=self.win_var, width=22)
         self._win_entry.pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Button(r2, text="+", width=3, command=self._add_map).pack(
+        ttk.Button(r3, text="+", width=3, command=self._add_map).pack(
             side=tk.LEFT)
-        ttk.Button(r2, text="\u2212", width=3, command=self._rm_map).pack(
+        ttk.Button(r3, text="\u2212", width=3, command=self._rm_map).pack(
             side=tk.LEFT, padx=(2, 0))
         self.map_list = tk.Listbox(self._adv_frame, height=2,
                                     font=("Consolas", 9), activestyle="dotbox")
@@ -298,6 +451,8 @@ class App:
             self.dry_var.set(c["dry"])
         if c.get("limit") is not None:
             self.limit_var.set(c["limit"])
+        if c.get("auto_seq") is not None:
+            self.auto_seq_var.set(c["auto_seq"])
         if c.get("autosave") is not None:
             self.autosave_var.set(c["autosave"])
         for mp in c.get("maps", []):
@@ -313,6 +468,7 @@ class App:
         _save_cfg({
             "src": self.src_var.get(), "out": self.out_var.get(),
             "dry": self.dry_var.get(), "limit": self.limit_var.get(),
+            "auto_seq": self.auto_seq_var.get(),
             "autosave": self.autosave_var.get(),
             "maps": maps, "geo": self.root.geometry(),
         })
@@ -396,7 +552,7 @@ class App:
             self.preview_var.set("")
             return
         _, prproj = self.projects[0]
-        project_root = prproj.parent.parent
+        project_root = _find_project_root(prproj)
         self.preview_var.set(f"Ej: .../{project_root.name}/{out}/")
 
     def _update_btn(self):
@@ -409,6 +565,29 @@ class App:
             self.run_btn.configure(text="\u25b6  EMPAQUETAR 1 PROYECTO")
         else:
             self.run_btn.configure(text=f"\u25b6  EMPAQUETAR {n} PROYECTOS")
+
+    # ── Sequence picker (thread-safe) ─────────────────────
+
+    def _ask_sequence(self, ranked: list[tuple[dict, float]]) -> dict | None:
+        """Llamado desde el worker thread. Muestra dialogo en el hilo principal
+        y espera la respuesta."""
+        self._seq_ranked = ranked
+        self._seq_event.clear()
+
+        # Pedir al hilo principal que muestre el dialogo
+        self.root.after(0, self._show_seq_dialog)
+        # Esperar a que el usuario elija
+        self._seq_event.wait()
+
+        return self._seq_result
+
+    def _show_seq_dialog(self):
+        """Se ejecuta en el hilo principal de tkinter."""
+        dlg = SequencePickerDialog(
+            self.root, self._seq_prproj_name, self._seq_ranked)
+        self.root.wait_window(dlg)
+        self._seq_result = dlg.result
+        self._seq_event.set()
 
     # ── Advanced ──────────────────────────────────────────
 
@@ -538,6 +717,7 @@ class App:
             projects = projects[:LIMIT_N]
 
         dry = self.dry_var.get()
+        auto_seq = self.auto_seq_var.get()
         raw_maps = [self.map_list.get(i) for i in range(self.map_list.size())]
 
         try:
@@ -567,20 +747,22 @@ class App:
 
         # Header
         mode_label = "DRY RUN (simulacion)" if dry else "EMPAQUETADO"
+        seq_label = "auto" if auto_seq else "manual"
         n = len(projects)
         limit_label = f"  (limite: {LIMIT_N})" if self.limit_var.get() else ""
         self._log_write(
-            f"  {mode_label}  |  {n} proyecto{'s' if n > 1 else ''}{limit_label}  |  Salida: {out}/",
+            f"  {mode_label}  |  {n} proyecto{'s' if n > 1 else ''}{limit_label}  |  Secuencia: {seq_label}  |  Salida: {out}/",
             "head",
         )
         self._log_write("")
 
         threading.Thread(
-            target=self._worker, args=(projects, out, dry, mappings),
+            target=self._worker,
+            args=(projects, out, dry, auto_seq, mappings),
             daemon=True,
         ).start()
 
-    def _worker(self, projects, out_name, dry_run, mappings):
+    def _worker(self, projects, out_name, dry_run, auto_seq, mappings):
         logger = logging.getLogger("premiere_gui")
         logger.setLevel(logging.INFO)
         logger.handlers.clear()
@@ -609,7 +791,14 @@ class App:
             logger.info("[%d/%d] %s %s", i + 1, total, label, bar)
 
             try:
-                project_root = prproj.parent.parent
+                project_root = _find_project_root(prproj)
+
+                # Callback para seleccion manual de secuencia
+                seq_cb = None
+                if not auto_seq:
+                    self._seq_prproj_name = prproj.name
+                    seq_cb = self._ask_sequence
+
                 stats = package_project(
                     prproj_path=prproj,
                     dest_root=project_root,
@@ -619,6 +808,7 @@ class App:
                     sequence_pattern=None,
                     path_mappings=mappings,
                     log=logger,
+                    sequence_callback=seq_cb,
                 )
 
                 copied = stats.get("copied", 0)
