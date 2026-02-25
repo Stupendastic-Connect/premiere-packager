@@ -479,8 +479,13 @@ class App:
             self.skip_done_var.set(c["skip_done"])
         if c.get("autosave") is not None:
             self.autosave_var.set(c["autosave"])
-        for mp in c.get("maps", []):
-            self.map_list.insert(tk.END, mp)
+        saved_maps = c.get("maps")
+        if saved_maps is not None:
+            for mp in saved_maps:
+                self.map_list.insert(tk.END, mp)
+        else:
+            # Default: mapeo Mac -> Win para /Volumes/SEGUIMIENTOS
+            self.map_list.insert(tk.END, "/Volumes/SEGUIMIENTOS=V:")
         if c.get("geo"):
             try:
                 self.root.geometry(c["geo"])
