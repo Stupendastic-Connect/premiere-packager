@@ -67,6 +67,9 @@ PROMOTE_PATTERNS = [
 # ContentAndMetadataState todo ceros = medio sintetico (barras, tono, etc.)
 SYNTHETIC_MEDIA_STATE = "00000000-0000-0000-0000-000000000000"
 
+# Extensiones de proyecto After Effects
+AE_PROJECT_EXTENSIONS = frozenset({".aep", ".aepx"})
+
 
 def setup_logging():
     logging.basicConfig(
@@ -788,6 +791,139 @@ def unique_folder_name(base_name: str, used: set[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# After Effects: escaneo de dependencias de footage
+# ---------------------------------------------------------------------------
+
+# Extensiones de footage que After Effects suele referenciar
+_AE_FOOTAGE_EXTENSIONS = frozenset({
+    # Video
+    ".mov", ".mp4", ".avi", ".mxf", ".m4v", ".mkv", ".wmv", ".mpg", ".mpeg",
+    ".m2t", ".m2ts", ".mts", ".r3d", ".braw", ".ari",
+    # Imagen / secuencia de imagenes
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".psd", ".ai", ".exr",
+    ".dpx", ".tga", ".bmp", ".gif", ".webp", ".svg", ".hdr",
+    # Audio
+    ".wav", ".mp3", ".aif", ".aiff", ".m4a", ".aac", ".flac", ".ogg",
+    # Proyectos Adobe / 3D
+    ".aep", ".aepx", ".mogrt", ".c4d", ".obj", ".fbx",
+    # Fuentes
+    ".otf", ".ttf",
+})
+
+# Regex para rutas absolutas en texto decodificado de binarios AE.
+# Al decodificar bytes con errors="replace", los bytes no-UTF-8 se convierten
+# en U+FFFD, que actuan como delimitadores naturales de las cadenas embebidas.
+_RE_AE_WIN_PATH = re.compile(
+    r'([A-Za-z]:[/\\][^\x00-\x1f\ufffd]+\.\w{2,10})(?=[^\w.]|$)')
+_RE_AE_MAC_PATH = re.compile(
+    r'(?<!:)(/(?:Volumes|Users)/[^\x00-\x1f\ufffd]+\.\w{2,10})(?=[^\w.]|$)')
+
+
+def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
+    """Escanea un proyecto After Effects (.aep/.aepx) buscando rutas de footage.
+
+    Para .aep (binario RIFX): decodifica como UTF-8 y busca patrones de rutas.
+    Para .aepx (XML): misma estrategia (las rutas estan en texto plano).
+    """
+    try:
+        data = aep_path.read_bytes()
+    except OSError as exc:
+        log.warning("    [AE] Error leyendo %s: %s", aep_path.name, exc)
+        return set()
+
+    if len(data) > 200_000_000:
+        log.warning("    [AE] %s muy grande (%s), omitiendo escaneo",
+                     aep_path.name, _fmt_size(len(data)))
+        return set()
+
+    # Descomprimir si es gzip (.aepx puede estar comprimido)
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except Exception:
+            pass
+
+    paths: set[str] = set()
+    exclude = str(aep_path)
+
+    # Decodificar como UTF-8; los bytes binarios se convierten en \ufffd
+    text = data.decode("utf-8", errors="replace")
+
+    for m in _RE_AE_WIN_PATH.finditer(text):
+        p = m.group(1)
+        if len(p) <= 500 and p != exclude:
+            try:
+                if Path(p).suffix.lower() in _AE_FOOTAGE_EXTENSIONS:
+                    paths.add(p)
+            except Exception:
+                pass
+
+    for m in _RE_AE_MAC_PATH.finditer(text):
+        p = m.group(1)
+        if len(p) <= 500 and p != exclude:
+            try:
+                if Path(p).suffix.lower() in _AE_FOOTAGE_EXTENSIONS:
+                    paths.add(p)
+            except Exception:
+                pass
+
+    return paths
+
+
+def _expand_ae_dependencies(
+    target_paths: set[str],
+    path_mappings: list[tuple[str, str]],
+    log: logging.Logger,
+) -> set[str]:
+    """Detecta archivos .aep/.aepx en los medios recolectados y escanea
+    sus dependencias de footage.  Soporta proyectos AE anidados."""
+    ae_deps: set[str] = set()
+    scanned: set[str] = set()
+
+    # Identificar .aep/.aepx en los medios recolectados
+    to_scan: set[tuple[str, str]] = set()
+    for orig in target_paths:
+        translated = translate_path(normalize_media_path(orig), path_mappings)
+        if Path(translated).suffix.lower() in AE_PROJECT_EXTENSIONS:
+            to_scan.add((orig, translated))
+
+    while to_scan:
+        current_batch = to_scan
+        to_scan = set()
+
+        for _orig, translated in current_batch:
+            if translated in scanned:
+                continue
+            scanned.add(translated)
+
+            src = Path(translated)
+            if not src.exists():
+                log.info("    [AE] %s (offline, dependencias no resueltas)", src.name)
+                continue
+
+            log.info("    [AE] Escaneando footage: %s", src.name)
+            deps = _scan_aep_for_footage(src, log)
+            new_deps = deps - target_paths - ae_deps
+
+            if new_deps:
+                ae_deps.update(new_deps)
+                log.info("    [AE]   -> %d archivos encontrados", len(new_deps))
+
+                # Buscar .aep anidados para escaneo recursivo
+                for dep in new_deps:
+                    dep_translated = translate_path(
+                        normalize_media_path(dep), path_mappings)
+                    if Path(dep_translated).suffix.lower() in AE_PROJECT_EXTENSIONS:
+                        if dep_translated not in scanned:
+                            to_scan.add((dep, dep_translated))
+
+    if ae_deps:
+        log.info("  Dependencias After Effects: +%d archivos", len(ae_deps))
+
+    return ae_deps
+
+
+# ---------------------------------------------------------------------------
 # Empaquetado de un proyecto
 # ---------------------------------------------------------------------------
 
@@ -913,6 +1049,11 @@ def package_project(
             # Recolectar medios de la secuencia (+ anidadas)
             target_paths = graph.collect_media_for_sequence(selected_seq)
             log.info("  Medios de esta secuencia: %d archivos", len(target_paths))
+
+    # --- Expandir con dependencias de After Effects ---
+    ae_extra = _expand_ae_dependencies(target_paths, path_mappings, log)
+    if ae_extra:
+        target_paths.update(ae_extra)
 
     if not target_paths:
         log.info("  Sin medios que copiar.")
