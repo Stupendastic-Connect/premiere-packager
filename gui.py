@@ -3,7 +3,7 @@
 gui.py - Interfaz grafica para Premiere Packager.
 
 Flujo:  Carpeta base  ->  Configurar  ->  Empaquetar
-Atajos: Ctrl+Enter = Empaquetar | Escape = Cancelar | Ctrl+L = Limpiar log
+Atajos: Ctrl+Enter = Empaquetar | Escape = Cancelar | Ctrl+L = Limpiar log | Ctrl+F = Buscar
 """
 
 import json
@@ -229,6 +229,11 @@ class App:
         self._timer_id: str | None = None
         self._start_time: float = 0
 
+        # Checkboxes y filtro de busqueda
+        self._checked: dict[str, bool] = {}
+        self._detached: set[str] = set()
+        self._all_iids: list[str] = []  # orden original de iids
+
         # Sincronizacion para dialogo de secuencia desde worker thread
         self._seq_event = threading.Event()
         self._seq_ranked: list = []
@@ -283,22 +288,43 @@ class App:
                                      padding=(6, 4))
         tree_frame.pack(fill=tk.X, pady=(0, 6))
 
+        # Barra de busqueda
+        sf = ttk.Frame(tree_frame)
+        sf.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(sf, text="\U0001f50d", font=("Segoe UI", 10)).pack(
+            side=tk.LEFT, padx=(0, 4))
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(
+            sf, textvariable=self.search_var, font=("Segoe UI", 10))
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._search_clear_btn = ttk.Button(
+            sf, text="\u2715", width=3, command=self._clear_search,
+            style="Small.TButton")
+        self._search_clear_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.search_var.trace_add("write", lambda *_: self._apply_filter())
+
         tf = ttk.Frame(tree_frame)
         tf.pack(fill=tk.BOTH, expand=True)
 
         self.tree = ttk.Treeview(
-            tf, columns=("path", "status"), show="headings",
+            tf, columns=("check", "path", "status"), show="headings",
             height=4, selectmode="browse",
         )
+        self.tree.heading("check", text="\u2611", anchor=tk.CENTER,
+                          command=self._toggle_all)
         self.tree.heading("path", text="Archivo", anchor=tk.W)
         self.tree.heading("status", text="Estado", anchor=tk.W)
-        self.tree.column("path", width=420, minwidth=180)
+        self.tree.column("check", width=30, minwidth=30, anchor=tk.CENTER,
+                         stretch=False)
+        self.tree.column("path", width=400, minwidth=180)
         self.tree.column("status", width=180, minwidth=80, anchor=tk.W)
 
         sb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
 
         self.tree.tag_configure("pending", foreground="#999")
         self.tree.tag_configure("active", foreground="#1565c0")
@@ -460,6 +486,8 @@ class App:
         self.root.bind("<Escape>", lambda e: self._do_cancel())
         self.root.bind("<Control-l>", lambda e: self._log_clear())
         self.root.bind("<Control-L>", lambda e: self._log_clear())
+        self.root.bind("<Control-f>", lambda e: self.search_entry.focus_set())
+        self.root.bind("<Control-F>", lambda e: self.search_entry.focus_set())
         self._win_entry.bind("<Return>", lambda e: self._add_map())
         self.map_list.bind("<Delete>", lambda e: self._rm_map())
 
@@ -528,9 +556,19 @@ class App:
 
     def _scan(self):
         self._scan_id = None
+        # Re-attach detached items before deleting
+        for iid in list(self._detached):
+            try:
+                self.tree.reattach(iid, "", tk.END)
+            except tk.TclError:
+                pass
+        self._detached.clear()
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.projects.clear()
+        self._checked.clear()
+        self._all_iids.clear()
+        self.search_var.set("")
 
         src = self.src_var.get().strip().strip('"').strip("'")
         if not src:
@@ -543,8 +581,11 @@ class App:
 
         if base.is_file() and base.suffix.lower() == ".prproj":
             self.projects.append((base.name, base))
+            self._checked["0"] = True
+            self._all_iids = ["0"]
             self.tree.insert("", tk.END, iid="0",
-                              values=(base.name, "Listo"), tags=("pending",))
+                              values=("\u2611", base.name, "Listo"),
+                              tags=("pending",))
             self.count_var.set("1 proyecto (archivo individual)")
             self._update_btn()
             self._update_preview()
@@ -635,15 +676,21 @@ class App:
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.projects.clear()
+        self._checked.clear()
+        self._all_iids.clear()
 
         for i, prproj in enumerate(best):
             try:
                 rel = str(prproj.relative_to(base))
             except ValueError:
                 rel = prproj.name
+            iid = str(i)
             self.projects.append((rel, prproj))
-            self.tree.insert("", tk.END, iid=str(i),
-                              values=(rel, "Listo"), tags=("pending",))
+            self._checked[iid] = True
+            self._all_iids.append(iid)
+            self.tree.insert("", tk.END, iid=iid,
+                              values=("\u2611", rel, "Listo"),
+                              tags=("pending",))
 
         n = len(best)
         total = len(found)
@@ -670,7 +717,7 @@ class App:
         self.preview_var.set(f"Ej: .../{project_root.name}/{out}/")
 
     def _update_btn(self):
-        n = len(self.projects)
+        n = sum(1 for iid in self._all_iids if self._checked.get(iid, True))
         if self.limit_var.get():
             n = min(n, LIMIT_N)
         if self._scanning:
@@ -733,6 +780,99 @@ class App:
         sel = self.map_list.curselection()
         if sel:
             self.map_list.delete(sel[0])
+
+    # ── Checkboxes ─────────────────────────────────────────
+
+    def _on_tree_click(self, event):
+        region = self.tree.identify_region(event.x, event.y)
+        col = self.tree.identify_column(event.x)
+        if col != "#1":  # solo columna check
+            return
+        if region == "heading":
+            self._toggle_all()
+        elif region in ("cell", "tree"):
+            iid = self.tree.identify_row(event.y)
+            if iid:
+                self._toggle_check(iid)
+
+    def _toggle_check(self, iid: str):
+        self._checked[iid] = not self._checked.get(iid, True)
+        self._update_check_display(iid)
+        self._update_count()
+        self._update_btn()
+
+    def _toggle_all(self):
+        # Si hay algun desmarcado visible, marcar todos; sino desmarcar todos
+        visible = [iid for iid in self._all_iids if iid not in self._detached]
+        any_unchecked = any(not self._checked.get(iid, True) for iid in visible)
+        new_state = True if any_unchecked else False
+        for iid in visible:
+            self._checked[iid] = new_state
+            self._update_check_display(iid)
+        self._update_count()
+        self._update_btn()
+
+    def _update_check_display(self, iid: str):
+        vals = list(self.tree.item(iid, "values"))
+        if vals:
+            vals[0] = "\u2611" if self._checked.get(iid, True) else "\u2610"
+            self.tree.item(iid, values=vals)
+
+    # ── Filtro de busqueda ────────────────────────────────
+
+    def _apply_filter(self):
+        query = self.search_var.get().strip().lower()
+        for iid in self._all_iids:
+            idx = int(iid)
+            display = self.projects[idx][0].lower() if idx < len(self.projects) else ""
+            if query and query not in display:
+                if iid not in self._detached:
+                    self.tree.detach(iid)
+                    self._detached.add(iid)
+            else:
+                if iid in self._detached:
+                    # Reattach en orden correcto
+                    self._detached.discard(iid)
+                    self._reattach_in_order(iid)
+        self._update_count()
+
+    def _reattach_in_order(self, iid: str):
+        """Reattach un iid en su posicion original relativa."""
+        idx = self._all_iids.index(iid)
+        # Buscar el iid anterior visible para insertar despues
+        prev_visible = None
+        for j in range(idx - 1, -1, -1):
+            candidate = self._all_iids[j]
+            if candidate not in self._detached:
+                prev_visible = candidate
+                break
+        if prev_visible is None:
+            self.tree.reattach(iid, "", 0)
+        else:
+            children = list(self.tree.get_children(""))
+            if prev_visible in children:
+                pos = children.index(prev_visible) + 1
+            else:
+                pos = tk.END
+            self.tree.reattach(iid, "", pos)
+
+    def _clear_search(self):
+        self.search_var.set("")
+        self.search_entry.focus_set()
+
+    def _update_count(self):
+        """Actualiza el contador reflejando seleccion y filtro."""
+        total = len(self.projects)
+        if total == 0:
+            return
+        checked = sum(1 for iid in self._all_iids if self._checked.get(iid, True))
+        visible = total - len(self._detached)
+        query = self.search_var.get().strip()
+        if query:
+            self.count_var.set(
+                f"{visible} mostrados, {checked}/{total} seleccionados")
+        else:
+            self.count_var.set(f"{checked}/{total} seleccionados")
 
     # ── Log ───────────────────────────────────────────────
 
@@ -832,9 +972,23 @@ class App:
         self._save()
         self._log_clear()
 
-        projects = list(self.projects)
+        # Limpiar filtro para ver progreso de todos
+        self.search_var.set("")
+
+        # Filtrar por checked, guardar indice original
+        projects = [
+            (i, d, p)
+            for i, (d, p) in enumerate(self.projects)
+            if self._checked.get(str(i), True)
+        ]
         if self.limit_var.get():
             projects = projects[:LIMIT_N]
+
+        if not projects:
+            messagebox.showinfo(
+                "Sin seleccion",
+                "No hay proyectos seleccionados para empaquetar.")
+            return
 
         dry = self.dry_var.get()
         auto_seq = self.auto_seq_var.get()
@@ -856,13 +1010,21 @@ class App:
         self.progress_label.set(f"0 / {len(projects)}")
         self._start_timer()
 
+        # Reset status de todos los items
+        selected_indices = {orig_idx for orig_idx, _, _ in projects}
         for i in range(len(self.projects)):
-            tag = "pending"
-            status = "Listo"
-            if self.limit_var.get() and i >= LIMIT_N:
+            iid = str(i)
+            check = "\u2611" if self._checked.get(iid, True) else "\u2610"
+            if i in selected_indices:
+                tag = "pending"
+                status = "Listo"
+            elif not self._checked.get(iid, True):
+                tag = "skip"
+                status = "No seleccionado"
+            else:
                 tag = "skip"
                 status = "Fuera del limite"
-            self.tree.item(str(i), values=(self.projects[i][0], status),
+            self.tree.item(iid, values=(check, self.projects[i][0], status),
                            tags=(tag,))
 
         # Header
@@ -895,20 +1057,21 @@ class App:
         ok_count = 0
         err_count = 0
 
-        for i, (display, prproj) in enumerate(projects):
+        for seq_i, (orig_idx, display, prproj) in enumerate(projects):
             if self._cancel_flag:
-                for j in range(i, total):
-                    self.root.after(0, self._set_status, j, "Cancelado", "skip")
+                for j in range(seq_i, total):
+                    oi = projects[j][0]
+                    self.root.after(0, self._set_status, oi, "Cancelado", "skip")
                 break
 
-            self.root.after(0, self._set_status, i, "Empaquetando\u2026",
-                            "active")
-            self.root.after(0, self._set_progress, i + 1, total)
+            self.root.after(0, self._set_status, orig_idx,
+                            "Empaquetando\u2026", "active")
+            self.root.after(0, self._set_progress, seq_i + 1, total)
 
             label = (display if len(display) < 50
                      else f".../{prproj.parent.name}/{prproj.name}")
-            bar = "\u2500" * max(1, 52 - len(f"[{i+1}/{total}] {label}"))
-            logger.info("[%d/%d] %s %s", i + 1, total, label, bar)
+            bar = "\u2500" * max(1, 52 - len(f"[{seq_i+1}/{total}] {label}"))
+            logger.info("[%d/%d] %s %s", seq_i + 1, total, label, bar)
 
             try:
                 project_root = _find_project_root(prproj)
@@ -937,7 +1100,8 @@ class App:
 
                 if has_errors:
                     status = f"\u2717 Errores ({len(stats['errors'])})"
-                    self.root.after(0, self._set_status, i, status, "error")
+                    self.root.after(0, self._set_status, orig_idx, status,
+                                    "error")
                     err_count += 1
                 else:
                     parts = []
@@ -947,12 +1111,13 @@ class App:
                     if missing:
                         parts.append(f"{missing} offline")
                     status = "\u2713 " + (", ".join(parts) if parts else "OK")
-                    self.root.after(0, self._set_status, i, status, "done")
+                    self.root.after(0, self._set_status, orig_idx, status,
+                                    "done")
                     ok_count += 1
 
             except Exception as e:
                 logger.error("  ERROR CRITICO: %s", e)
-                self.root.after(0, self._set_status, i,
+                self.root.after(0, self._set_status, orig_idx,
                                 "\u2717 Error critico", "error")
                 err_count += 1
 
@@ -996,8 +1161,10 @@ class App:
     def _set_status(self, idx: int, text: str, tag: str):
         iid = str(idx)
         display = self.projects[idx][0]
-        self.tree.item(iid, values=(display, text), tags=(tag,))
-        self.tree.see(iid)
+        check = "\u2611" if self._checked.get(iid, True) else "\u2610"
+        self.tree.item(iid, values=(check, display, text), tags=(tag,))
+        if iid not in self._detached:
+            self.tree.see(iid)
 
     def _set_progress(self, current: int, total: int):
         self.pbar["value"] = current
