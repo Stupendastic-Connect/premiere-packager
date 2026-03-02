@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -614,31 +615,70 @@ class App:
         ).start()
 
     def _scan_worker(self, base: Path, include_autosave: bool, out_name: str):
-        """Hilo que escanea .prproj con os.walk y poda de directorios."""
-        found: list[Path] = []
-        base_str = str(base)
+        """Hilo que escanea .prproj en paralelo por subdirectorio."""
         skip_dirs = _ARCHIVE_NAMES | {"node_modules", ".git", "__pycache__"}
         if out_name:
             skip_dirs.add(out_name.lower())
+
+        counter = [0]  # mutable para compartir entre hilos
+        lock = threading.Lock()
+
+        def _walk_tree(root_str: str) -> list[Path]:
+            """Camina un arbol de directorios y devuelve los .prproj."""
+            results: list[Path] = []
+            try:
+                for dirpath, dirnames, filenames in os.walk(root_str):
+                    if self._scan_cancel:
+                        return results
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if d.lower() not in skip_dirs
+                        and (include_autosave
+                             or d != "Adobe Premiere Pro Auto-Save")
+                    ]
+                    for fname in filenames:
+                        if fname.lower().endswith(".prproj"):
+                            results.append(Path(dirpath, fname))
+                            with lock:
+                                counter[0] += 1
+                                if counter[0] % 5 == 0:
+                                    n = counter[0]
+                                    self.root.after(0, self._scan_progress, n)
+            except OSError:
+                pass
+            return results
+
+        base_str = str(base)
+        found: list[Path] = []
+
         try:
-            for dirpath, dirnames, filenames in os.walk(base_str):
-                if self._scan_cancel:
-                    return
-                # Podar directorios in-place para no descender
-                dirnames[:] = [
-                    d for d in dirnames
-                    if d.lower() not in skip_dirs
-                    and (include_autosave
-                         or d != "Adobe Premiere Pro Auto-Save")
-                ]
-                for fname in filenames:
-                    if fname.lower().endswith(".prproj"):
-                        found.append(Path(dirpath, fname))
-                        if len(found) % 20 == 0:
-                            self.root.after(0, self._scan_progress, len(found))
+            # Recoger .prproj del directorio raiz + listar subdirectorios
+            subdirs: list[str] = []
+            with os.scandir(base_str) as it:
+                for entry in it:
+                    if self._scan_cancel:
+                        return
+                    if entry.is_dir(follow_symlinks=False):
+                        if (entry.name.lower() not in skip_dirs
+                                and (include_autosave
+                                     or entry.name != "Adobe Premiere Pro Auto-Save")):
+                            subdirs.append(entry.path)
+                    elif entry.name.lower().endswith(".prproj"):
+                        found.append(Path(entry.path))
+
+            # Caminar subdirectorios en paralelo
+            workers = min(8, max(1, len(subdirs)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_walk_tree, sd): sd for sd in subdirs}
+                for future in as_completed(futures):
+                    if self._scan_cancel:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        return
+                    found.extend(future.result())
         except OSError:
             self.root.after(0, self._scan_finish, base, [])
             return
+
         found.sort()
         self.root.after(0, self._scan_finish, base, found)
 
