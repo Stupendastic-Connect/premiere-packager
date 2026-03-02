@@ -311,8 +311,7 @@ class App:
             tf, columns=("check", "path", "status"), show="headings",
             height=4, selectmode="browse",
         )
-        self.tree.heading("check", text="\u2611", anchor=tk.CENTER,
-                          command=self._toggle_all)
+        self.tree.heading("check", text="\u2611", anchor=tk.CENTER)
         self.tree.heading("path", text="Archivo", anchor=tk.W)
         self.tree.heading("status", text="Estado", anchor=tk.W)
         self.tree.column("check", width=30, minwidth=30, anchor=tk.CENTER,
