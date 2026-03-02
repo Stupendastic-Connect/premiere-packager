@@ -8,6 +8,7 @@ Atajos: Ctrl+Enter = Empaquetar | Escape = Cancelar | Ctrl+L = Limpiar log | Ctr
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -605,26 +606,37 @@ class App:
         self.count_var.set("Buscando proyectos\u2026")
         self.progress_label.set("Escaneando\u2026")
         self._update_btn()
+        include_autosave = self.autosave_var.get()
+        out_name = self.out_var.get().strip()
         threading.Thread(
             target=self._scan_worker,
-            args=(base,),
+            args=(base, include_autosave, out_name),
             daemon=True,
         ).start()
 
-    def _scan_worker(self, base: Path):
-        """Hilo que escanea .prproj y notifica a la UI progresivamente."""
+    def _scan_worker(self, base: Path, include_autosave: bool, out_name: str):
+        """Hilo que escanea .prproj con os.walk y poda de directorios."""
         found: list[Path] = []
-        include_autosave = self.autosave_var.get()
+        base_str = str(base)
+        skip_dirs = _ARCHIVE_NAMES | {"node_modules", ".git", "__pycache__"}
+        if out_name:
+            skip_dirs.add(out_name.lower())
         try:
-            for p in base.rglob("*.prproj"):
+            for dirpath, dirnames, filenames in os.walk(base_str):
                 if self._scan_cancel:
                     return
-                if not include_autosave and "Adobe Premiere Pro Auto-Save" in str(p):
-                    continue
-                found.append(p)
-                if len(found) % 20 == 0:
-                    n = len(found)
-                    self.root.after(0, self._scan_progress, n)
+                # Podar directorios in-place para no descender
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d.lower() not in skip_dirs
+                    and (include_autosave
+                         or d != "Adobe Premiere Pro Auto-Save")
+                ]
+                for fname in filenames:
+                    if fname.lower().endswith(".prproj"):
+                        found.append(Path(dirpath, fname))
+                        if len(found) % 20 == 0:
+                            self.root.after(0, self._scan_progress, len(found))
         except OSError:
             self.root.after(0, self._scan_finish, base, [])
             return
