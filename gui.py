@@ -727,7 +727,12 @@ class App:
         self.preview_var.set(f"Ej: .../{project_root.name}/{out}/")
 
     def _update_btn(self):
-        n = sum(1 for iid in self._all_iids if self._checked.get(iid, True))
+        if self._detached:
+            # Con filtro activo: contar solo checked + visibles
+            n = sum(1 for iid in self._all_iids
+                    if self._checked.get(iid, True) and iid not in self._detached)
+        else:
+            n = sum(1 for iid in self._all_iids if self._checked.get(iid, True))
         if self.limit_var.get():
             n = min(n, LIMIT_N)
         if self._scanning:
@@ -851,6 +856,7 @@ class App:
                     self._detached.discard(iid)
                     self._reattach_in_order(iid)
         self._update_count()
+        self._update_btn()
 
     def _reattach_in_order(self, iid: str):
         """Reattach un iid en su posicion original relativa."""
@@ -988,14 +994,19 @@ class App:
         self._save()
         self._log_clear()
 
+        # Capturar visibles antes de limpiar el filtro
+        has_filter = bool(self.search_var.get().strip())
+        visible_iids = set(self._all_iids) - self._detached if has_filter else None
+
         # Limpiar filtro para ver progreso de todos
         self.search_var.set("")
 
-        # Filtrar por checked, guardar indice original
+        # Filtrar por checked (y visibles si habia filtro activo)
         projects = [
             (i, d, p)
             for i, (d, p) in enumerate(self.projects)
             if self._checked.get(str(i), True)
+            and (visible_iids is None or str(i) in visible_iids)
         ]
         if self.limit_var.get():
             projects = projects[:LIMIT_N]
