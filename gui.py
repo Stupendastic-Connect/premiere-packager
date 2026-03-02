@@ -813,13 +813,19 @@ class App:
         self._update_btn()
 
     def _toggle_all(self):
-        # Si hay algun desmarcado visible, marcar todos; sino desmarcar todos
         visible = [iid for iid in self._all_iids if iid not in self._detached]
         any_unchecked = any(not self._checked.get(iid, True) for iid in visible)
-        new_state = True if any_unchecked else False
-        for iid in visible:
-            self._checked[iid] = new_state
-            self._update_check_display(iid)
+        if any_unchecked:
+            # Marcar solo los visibles
+            for iid in visible:
+                self._checked[iid] = True
+                self._update_check_display(iid)
+        else:
+            # Desmarcar TODOS (visibles + ocultos)
+            for iid in self._all_iids:
+                self._checked[iid] = False
+                if iid not in self._detached:
+                    self._update_check_display(iid)
         self._update_count()
         self._update_btn()
 
