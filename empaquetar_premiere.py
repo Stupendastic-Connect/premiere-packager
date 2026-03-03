@@ -26,6 +26,7 @@ import argparse
 import fnmatch
 import gzip
 import logging
+import os
 import posixpath
 import re
 import shutil
@@ -923,6 +924,48 @@ def _expand_ae_dependencies(
     return ae_deps
 
 
+# Carpetas de archivo que se ignoran al buscar .aep en el arbol del proyecto
+_AE_SKIP_DIRS = frozenset({
+    "antic", "old", "backup", "archive", "antiguo", "bak", "prev",
+    "node_modules", ".git", "__pycache__",
+    "adobe premiere pro auto-save",
+})
+
+
+def _find_ae_projects_in_tree(
+    project_root: Path,
+    log: logging.Logger,
+    exclude_folder: str = "",
+) -> set[str]:
+    """Busca archivos .aep/.aepx en el arbol del proyecto.
+
+    Esto captura proyectos After Effects que no estan referenciados
+    directamente en la secuencia de Premiere (ej. cuando se usa el render
+    del AE en vez de Dynamic Link).
+    """
+    skip = _AE_SKIP_DIRS
+    if exclude_folder:
+        skip = skip | {exclude_folder.lower()}
+
+    ae_files: set[str] = set()
+    try:
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d.lower() not in skip
+            ]
+            for fname in filenames:
+                if Path(fname).suffix.lower() in AE_PROJECT_EXTENSIONS:
+                    ae_files.add(str(Path(dirpath) / fname))
+    except OSError:
+        pass
+
+    if ae_files:
+        log.info("  Proyectos After Effects en carpeta: %d", len(ae_files))
+
+    return ae_files
+
+
 # ---------------------------------------------------------------------------
 # Empaquetado de un proyecto
 # ---------------------------------------------------------------------------
@@ -1049,6 +1092,11 @@ def package_project(
             # Recolectar medios de la secuencia (+ anidadas)
             target_paths = graph.collect_media_for_sequence(selected_seq)
             log.info("  Medios de esta secuencia: %d archivos", len(target_paths))
+
+    # --- Incluir proyectos After Effects del arbol del proyecto ---
+    ae_projects = _find_ae_projects_in_tree(dest_root, log, exclude_folder=folder_name)
+    if ae_projects:
+        target_paths.update(ae_projects)
 
     # --- Expandir con dependencias de After Effects ---
     ae_extra = _expand_ae_dependencies(target_paths, path_mappings, log)

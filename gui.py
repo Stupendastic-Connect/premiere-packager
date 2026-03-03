@@ -37,6 +37,9 @@ _ARCHIVE_NAMES = {"antic", "old", "backup", "archive", "antiguo", "bak", "prev"}
 # Patron para backups de Premiere: nombre_1.prproj, nombre_22.prproj
 _BACKUP_SUFFIX = re.compile(r"_\d+$")
 
+# Patron para detectar carpetas numeradas: "1. Material", "2. Projects", "10- Renders"
+_NUMBERED_DIR = re.compile(r"^\d+[\.\-\s]")
+
 
 def _pick_best_prproj(group: list[Path]) -> Path:
     """De una lista de .prproj del mismo proyecto, elige el mas reciente."""
@@ -49,21 +52,29 @@ def _pick_best_prproj(group: list[Path]) -> Path:
 def _find_project_root(prproj: Path) -> Path:
     """Sube desde el .prproj hasta encontrar la carpeta del proyecto.
 
-    Busca la carpeta numerada mas alta en el arbol (ej. '2. Projects')
-    y devuelve su padre.  Estructura tipica:
+    Busca la carpeta numerada mas alta en un grupo contiguo de carpetas
+    numeradas y devuelve su padre.  Estructura tipica:
         Villa Rosita / 2. Projects / 2. Premiere / archivo.prproj
         Villa Rosita / 2. Projects / archivo.prproj
     En ambos casos devuelve Villa Rosita.
+
+    Se detiene al encontrar una carpeta no numerada despues de haber visto
+    una numerada, para no subir mas alla de la raiz del proyecto
+    (ej. evitar que '3. Trabajo/Clientes/Proyecto/2. Projects/' suba hasta
+    '3. Trabajo' y devuelva la raiz del disco).
     """
     topmost_numbered = None
+    found_numbered = False
     current = prproj.parent
     for _ in range(5):
         if current == current.parent:
             break
-        if (len(current.name) > 2
-                and current.name[0].isdigit()
-                and current.name[1] in ". "):
+        if _NUMBERED_DIR.match(current.name):
             topmost_numbered = current
+            found_numbered = True
+        elif found_numbered:
+            # Carpeta no numerada despues de una numerada: la raiz esta aqui
+            break
         current = current.parent
 
     if topmost_numbered is not None:
