@@ -929,6 +929,8 @@ _AE_SKIP_DIRS = frozenset({
     "antic", "old", "backup", "archive", "antiguo", "bak", "prev",
     "node_modules", ".git", "__pycache__",
     "adobe premiere pro auto-save",
+    "almacenamiento automático de adobe after effects",
+    "adobe after effects auto-save",
 })
 
 
