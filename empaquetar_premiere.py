@@ -871,10 +871,32 @@ def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
     return paths
 
 
+def _try_resolve_offline(src: Path, project_root: Path) -> Path | None:
+    """Intenta encontrar un archivo offline buscando sub-rutas bajo project_root.
+
+    Util cuando archivos referenciados por rutas de Dropbox u otras ubicaciones
+    estan sincronizados en el NAS/disco del proyecto con la misma estructura
+    de carpetas pero diferente raiz.
+
+    Prueba sufijos progresivamente mas cortos de la ruta original (de mas
+    especifico a menos, minimo 2 componentes: carpeta padre + nombre).
+    """
+    parts = src.parts
+    if len(parts) < 3:
+        return None
+    for i in range(1, len(parts) - 1):
+        suffix = Path(*parts[i:])
+        candidate = project_root / suffix
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
 def _expand_ae_dependencies(
     target_paths: set[str],
     path_mappings: list[tuple[str, str]],
     log: logging.Logger,
+    project_root: Path | None = None,
 ) -> set[str]:
     """Detecta archivos .aep/.aepx en los medios recolectados y escanea
     sus dependencias de footage.  Soporta proyectos AE anidados."""
@@ -898,6 +920,11 @@ def _expand_ae_dependencies(
             scanned.add(translated)
 
             src = Path(translated)
+            if not src.exists() and project_root is not None:
+                resolved = _try_resolve_offline(src, project_root)
+                if resolved is not None:
+                    log.info("    [AE] %s resuelto -> %s", src.name, resolved)
+                    src = resolved
             if not src.exists():
                 log.info("    [AE] %s (offline, dependencias no resueltas)", src.name)
                 continue
@@ -1101,7 +1128,7 @@ def package_project(
         target_paths.update(ae_projects)
 
     # --- Expandir con dependencias de After Effects ---
-    ae_extra = _expand_ae_dependencies(target_paths, path_mappings, log)
+    ae_extra = _expand_ae_dependencies(target_paths, path_mappings, log, dest_root)
     if ae_extra:
         target_paths.update(ae_extra)
 
@@ -1154,6 +1181,30 @@ def package_project(
         translated_count = sum(1 for o in target_paths if str(src_map[o]) != o)
         if translated_count:
             log.info("  Rutas traducidas Mac->Win: %d/%d", translated_count, len(target_paths))
+
+    # --- Resolver archivos offline buscando en la raiz del proyecto ---
+    resolved_count = 0
+    for orig in sorted(target_paths):
+        src = src_map[orig]
+        if src.exists():
+            continue
+        resolved = _try_resolve_offline(src, project_root)
+        if resolved is None:
+            continue
+        log.info("    [RESUELTO] %s -> %s", src.name, resolved)
+        src_map[orig] = resolved
+        resolved_count += 1
+        # Recalcular destino segun nueva ubicacion
+        try:
+            rel = resolved.relative_to(project_root)
+            clean_parts = [_clean_folder_name(p) for p in rel.parent.parts]
+            clean_rel = Path(*clean_parts, rel.name) if clean_parts else rel
+            path_map[orig] = project_folder / clean_rel
+        except ValueError:
+            path_map[orig] = media_dest_path(str(resolved), media_folder)
+
+    if resolved_count:
+        log.info("  Archivos offline resueltos: %d", resolved_count)
 
     copied_origs: set[str] = set()  # Medios que se copiaron/copiarian
     for orig in sorted(target_paths):
