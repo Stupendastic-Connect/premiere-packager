@@ -110,7 +110,7 @@ class SequencePickerDialog(tk.Toplevel):
     def __init__(self, parent, prproj_name: str,
                  ranked: list[tuple[dict, float]]):
         super().__init__(parent)
-        self.result: dict | None = None
+        self.result: list[dict] | None = None
         self.ranked = ranked
         self.transient(parent)
         self.grab_set()
@@ -121,7 +121,7 @@ class SequencePickerDialog(tk.Toplevel):
         f = ttk.Frame(self, padding=(12, 10))
         f.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(f, text="Selecciona la secuencia a empaquetar:",
+        ttk.Label(f, text="Selecciona una o varias secuencias (Ctrl/Shift+click):",
                   font=("Segoe UI", 10)).pack(anchor=tk.W, pady=(0, 6))
 
         # Treeview con columnas
@@ -131,7 +131,7 @@ class SequencePickerDialog(tk.Toplevel):
 
         self.tree = ttk.Treeview(
             tf, columns=cols, show="headings",
-            height=min(len(ranked), 12), selectmode="browse",
+            height=min(len(ranked), 12), selectmode="extended",
         )
         self.tree.heading("name", text="Nombre", anchor=tk.W)
         self.tree.heading("clips", text="Clips", anchor=tk.E)
@@ -197,8 +197,7 @@ class SequencePickerDialog(tk.Toplevel):
     def _ok(self):
         sel = self.tree.selection()
         if sel:
-            idx = int(sel[0])
-            self.result = self.ranked[idx][0]
+            self.result = [self.ranked[int(s)][0] for s in sel]
         self.grab_release()
         self.destroy()
 

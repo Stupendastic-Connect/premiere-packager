@@ -1100,27 +1100,33 @@ def package_project(
                 ranked = filtered
 
             # Seleccionar segun modo
-            selected = None
+            selected_list: list[dict] | None = None
             if sequence_callback is not None:
-                # GUI callback: recibe ranked, devuelve info dict o None
-                selected = sequence_callback(ranked)
+                # GUI callback: recibe ranked, devuelve lista de info dicts o None
+                selected_list = sequence_callback(ranked)
             elif mode == "auto":
-                selected = select_sequence_auto(ranked, log)
+                s = select_sequence_auto(ranked, log)
+                selected_list = [s] if s else None
             elif mode == "pattern":
-                selected = select_sequence_by_pattern(ranked, sequence_pattern, log)
+                s = select_sequence_by_pattern(ranked, sequence_pattern, log)
+                selected_list = [s] if s else None
             else:  # interactive
-                selected = select_sequence_interactive(ranked, log)
+                s = select_sequence_interactive(ranked, log)
+                selected_list = [s] if s else None
 
-            if selected is None:
+            if not selected_list:
                 log.warning("  Sin secuencia seleccionada. Saltando proyecto.")
                 return stats
 
-            log.info("  Secuencia: %s", selected["name"])
-            selected_seq = selected["element"]
+            names = [s["name"] for s in selected_list]
+            log.info("  Secuencia(s): %s", ", ".join(names))
 
-            # Recolectar medios de la secuencia (+ anidadas)
-            target_paths = graph.collect_media_for_sequence(selected_seq)
-            log.info("  Medios de esta secuencia: %d archivos", len(target_paths))
+            # Recolectar medios de todas las secuencias seleccionadas
+            target_paths: set[str] = set()
+            for sel in selected_list:
+                target_paths |= graph.collect_media_for_sequence(sel["element"])
+            log.info("  Medios de %d secuencia(s): %d archivos",
+                     len(selected_list), len(target_paths))
 
     # --- Incluir proyectos After Effects del arbol del proyecto ---
     ae_projects = _find_ae_projects_in_tree(dest_root, log, exclude_folder=folder_name)
