@@ -871,32 +871,95 @@ def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
     return paths
 
 
-def _try_resolve_offline(src: Path, project_root: Path) -> Path | None:
-    """Intenta encontrar un archivo offline buscando sub-rutas bajo project_root.
+class FileIndex:
+    """Indice de archivos bajo un directorio, construido con un solo os.walk.
 
-    Util cuando archivos referenciados por rutas de Dropbox u otras ubicaciones
-    estan sincronizados en el NAS/disco del proyecto con la misma estructura
-    de carpetas pero diferente raiz.
-
-    Prueba sufijos progresivamente mas cortos de la ruta original (de mas
-    especifico a menos, minimo 2 componentes: carpeta padre + nombre).
+    Permite busqueda rapida por nombre de archivo con deteccion de ambiguedad
+    y scoring por coincidencia de carpetas padre.  Tambien recolecta proyectos
+    After Effects (.aep/.aepx) como subproducto del recorrido.
     """
-    parts = src.parts
-    if len(parts) < 3:
+
+    def __init__(
+        self,
+        project_root: Path,
+        skip_dirs: frozenset[str] = frozenset(),
+        exclude_folder: str = "",
+    ) -> None:
+        self._root = project_root
+        self._by_name: dict[str, list[Path]] = {}
+        self.ae_projects: set[str] = set()
+
+        skip = skip_dirs
+        if exclude_folder:
+            skip = skip | {exclude_folder.lower()}
+
+        try:
+            for dirpath, dirnames, filenames in os.walk(project_root):
+                dirnames[:] = [d for d in dirnames if d.lower() not in skip]
+                for fname in filenames:
+                    full = Path(dirpath) / fname
+                    key = unicodedata.normalize("NFC", fname).lower()
+                    self._by_name.setdefault(key, []).append(full)
+                    if Path(fname).suffix.lower() in AE_PROJECT_EXTENSIONS:
+                        self.ae_projects.add(str(full))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _suffix_score(original: Path, candidate: Path) -> int:
+        """Cuenta componentes de carpeta padre que coinciden de derecha a izq."""
+        orig_parts = [p.lower() for p in original.parent.parts]
+        cand_parts = [p.lower() for p in candidate.parent.parts]
+        score = 0
+        for o, c in zip(reversed(orig_parts), reversed(cand_parts)):
+            if o == c:
+                score += 1
+            else:
+                break
+        return score
+
+    def resolve(self, src: Path, log: logging.Logger) -> Path | None:
+        """Busca un archivo offline en el indice por nombre + scoring.
+
+        Retorna None si no hay candidatos o si hay ambiguedad irresoluble.
+        """
+        key = unicodedata.normalize("NFC", src.name).lower()
+        candidates = self._by_name.get(key, [])
+
+        if not candidates:
+            log.debug("    [NO ENCONTRADO] %s: no existe en arbol del proyecto", src.name)
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Multiples candidatos: scoring por coincidencia de carpetas padre
+        scored = [(self._suffix_score(src, c), c) for c in candidates]
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        best_score, best = scored[0]
+        second_score = scored[1][0]
+
+        if best_score > second_score:
+            return best
+
+        # Empate -> ambiguo, no resolver
+        log.warning(
+            "    [AMBIGUO]  %s: %d coincidencias con mismo score, no resuelto",
+            src.name, sum(1 for s, _ in scored if s == best_score),
+        )
+        log.debug(
+            "               Candidatos: %s",
+            [str(c) for _, c in scored],
+        )
         return None
-    for i in range(1, len(parts) - 1):
-        suffix = Path(*parts[i:])
-        candidate = project_root / suffix
-        if candidate.exists() and candidate.is_file():
-            return candidate
-    return None
 
 
 def _expand_ae_dependencies(
     target_paths: set[str],
     path_mappings: list[tuple[str, str]],
     log: logging.Logger,
-    project_root: Path | None = None,
+    file_index: FileIndex | None = None,
 ) -> set[str]:
     """Detecta archivos .aep/.aepx en los medios recolectados y escanea
     sus dependencias de footage.  Soporta proyectos AE anidados."""
@@ -920,13 +983,16 @@ def _expand_ae_dependencies(
             scanned.add(translated)
 
             src = Path(translated)
-            if not src.exists() and project_root is not None:
-                resolved = _try_resolve_offline(src, project_root)
+            if not src.exists() and file_index is not None:
+                resolved = file_index.resolve(src, log)
                 if resolved is not None:
                     log.info("    [AE] %s resuelto -> %s", src.name, resolved)
                     src = resolved
             if not src.exists():
-                log.info("    [AE] %s (offline, dependencias no resueltas)", src.name)
+                log.warning(
+                    "    [AE] %s (offline, dependencias no incluidas) - %s",
+                    src.name, src,
+                )
                 continue
 
             log.info("    [AE] Escaneando footage: %s", src.name)
@@ -959,40 +1025,6 @@ _AE_SKIP_DIRS = frozenset({
     "almacenamiento automático de adobe after effects",
     "adobe after effects auto-save",
 })
-
-
-def _find_ae_projects_in_tree(
-    project_root: Path,
-    log: logging.Logger,
-    exclude_folder: str = "",
-) -> set[str]:
-    """Busca archivos .aep/.aepx en el arbol del proyecto.
-
-    Esto captura proyectos After Effects que no estan referenciados
-    directamente en la secuencia de Premiere (ej. cuando se usa el render
-    del AE en vez de Dynamic Link).
-    """
-    skip = _AE_SKIP_DIRS
-    if exclude_folder:
-        skip = skip | {exclude_folder.lower()}
-
-    ae_files: set[str] = set()
-    try:
-        for dirpath, dirnames, filenames in os.walk(project_root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d.lower() not in skip
-            ]
-            for fname in filenames:
-                if Path(fname).suffix.lower() in AE_PROJECT_EXTENSIONS:
-                    ae_files.add(str(Path(dirpath) / fname))
-    except OSError:
-        pass
-
-    if ae_files:
-        log.info("  Proyectos After Effects en carpeta: %d", len(ae_files))
-
-    return ae_files
 
 
 # ---------------------------------------------------------------------------
@@ -1128,13 +1160,16 @@ def package_project(
             log.info("  Medios de %d secuencia(s): %d archivos",
                      len(selected_list), len(target_paths))
 
+    # --- Construir indice de archivos (un solo os.walk) ---
+    file_index = FileIndex(dest_root, _AE_SKIP_DIRS, exclude_folder=folder_name)
+
     # --- Incluir proyectos After Effects del arbol del proyecto ---
-    ae_projects = _find_ae_projects_in_tree(dest_root, log, exclude_folder=folder_name)
-    if ae_projects:
-        target_paths.update(ae_projects)
+    if file_index.ae_projects:
+        log.info("  Proyectos After Effects en carpeta: %d", len(file_index.ae_projects))
+        target_paths.update(file_index.ae_projects)
 
     # --- Expandir con dependencias de After Effects ---
-    ae_extra = _expand_ae_dependencies(target_paths, path_mappings, log, dest_root)
+    ae_extra = _expand_ae_dependencies(target_paths, path_mappings, log, file_index)
     if ae_extra:
         target_paths.update(ae_extra)
 
@@ -1190,12 +1225,17 @@ def package_project(
 
     # --- Resolver archivos offline buscando en la raiz del proyecto ---
     resolved_count = 0
+    ambiguous_count = 0
     for orig in sorted(target_paths):
         src = src_map[orig]
         if src.exists():
             continue
-        resolved = _try_resolve_offline(src, project_root)
+        resolved = file_index.resolve(src, log)
         if resolved is None:
+            # Contar ambiguos (resolve ya logueo [AMBIGUO] si aplica)
+            key = unicodedata.normalize("NFC", src.name).lower()
+            if len(file_index._by_name.get(key, [])) > 1:
+                ambiguous_count += 1
             continue
         log.info("    [RESUELTO] %s -> %s", src.name, resolved)
         src_map[orig] = resolved
@@ -1209,8 +1249,13 @@ def package_project(
         except ValueError:
             path_map[orig] = media_dest_path(str(resolved), media_folder)
 
-    if resolved_count:
-        log.info("  Archivos offline resueltos: %d", resolved_count)
+    if resolved_count or ambiguous_count:
+        parts = []
+        if resolved_count:
+            parts.append(f"resueltos: {resolved_count}")
+        if ambiguous_count:
+            parts.append(f"ambiguos: {ambiguous_count}")
+        log.info("  Archivos offline %s", " | ".join(parts))
 
     copied_origs: set[str] = set()  # Medios que se copiaron/copiarian
     for orig in sorted(target_paths):

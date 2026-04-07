@@ -922,7 +922,7 @@ class App:
             tag = "ok"
         elif "guardado" in text.lower():
             tag = "done"
-        elif "[OFFLINE]" in text:
+        elif "[OFFLINE]" in text or "[AMBIGUO]" in text:
             tag = "warn"
         elif "Omitidos" in text or "no encontrad" in text:
             tag = "warn"
