@@ -397,13 +397,15 @@ class App:
 
         self._adv_open = False
         self._adv_btn = ttk.Button(
-            r2, text="\u25b8 Mapeos Mac\u2192Win",
+            r2, text="\u25b8 Avanzado",
             command=self._toggle_adv, style="Small.TButton",
         )
         self._adv_btn.pack(side=tk.LEFT)
 
         # Mapeos (oculto)
         self._adv_frame = ttk.Frame(m, padding=(8, 4, 0, 0))
+        ttk.Label(self._adv_frame, text="Mapeos Mac\u2192Win:",
+                  font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(0, 2))
         r3 = ttk.Frame(self._adv_frame)
         r3.pack(fill=tk.X, pady=(0, 3))
         ttk.Label(r3, text="Mac:").pack(side=tk.LEFT)
@@ -421,6 +423,27 @@ class App:
         self.map_list = tk.Listbox(self._adv_frame, height=2,
                                     font=("Consolas", 9), activestyle="dotbox")
         self.map_list.pack(fill=tk.X)
+
+        # Rutas de busqueda adicionales (dentro del frame avanzado)
+        ttk.Label(self._adv_frame, text="Buscar offline en:",
+                  font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(6, 2))
+        sr = ttk.Frame(self._adv_frame)
+        sr.pack(fill=tk.X, pady=(0, 3))
+        self.search_root_var = tk.StringVar()
+        self._search_root_entry = ttk.Entry(
+            sr, textvariable=self.search_root_var, width=44)
+        self._search_root_entry.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(sr, text="\u2026", width=3,
+                   command=self._browse_search_root).pack(side=tk.LEFT)
+        ttk.Button(sr, text="+", width=3,
+                   command=self._add_search_root).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(sr, text="\u2212", width=3,
+                   command=self._rm_search_root).pack(side=tk.LEFT, padx=(2, 0))
+        self._search_root_entry.bind("<Return>", lambda e: self._add_search_root())
+        self.search_root_list = tk.Listbox(
+            self._adv_frame, height=2,
+            font=("Consolas", 9), activestyle="dotbox")
+        self.search_root_list.pack(fill=tk.X)
 
         # ── Separador ──
         ttk.Separator(m, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(10, 0))
@@ -532,6 +555,16 @@ class App:
         for dm in default_maps:
             if dm not in saved_maps:
                 self.map_list.insert(tk.END, dm)
+        default_search_roots = [
+            "V:\\",
+            "Z:\\DATA\\PROYECTOS",
+        ]
+        saved_roots = c.get("search_roots", [])
+        for sr in saved_roots:
+            self.search_root_list.insert(tk.END, sr)
+        for dr in default_search_roots:
+            if dr not in saved_roots:
+                self.search_root_list.insert(tk.END, dr)
         if c.get("geo"):
             try:
                 self.root.geometry(c["geo"])
@@ -540,12 +573,15 @@ class App:
 
     def _save(self):
         maps = [self.map_list.get(i) for i in range(self.map_list.size())]
+        sroots = [self.search_root_list.get(i)
+                  for i in range(self.search_root_list.size())]
         _save_cfg({
             "src": self.src_var.get(), "out": self.out_var.get(),
             "dry": self.dry_var.get(), "limit": self.limit_var.get(),
             "auto_seq": self.auto_seq_var.get(), "skip_done": self.skip_done_var.get(),
             "autosave": self.autosave_var.get(),
-            "maps": maps, "geo": self.root.geometry(),
+            "maps": maps, "search_roots": sroots,
+            "geo": self.root.geometry(),
         })
 
     # ── Browse ────────────────────────────────────────────
@@ -786,11 +822,11 @@ class App:
     def _toggle_adv(self):
         if self._adv_open:
             self._adv_frame.pack_forget()
-            self._adv_btn.configure(text="\u25b8 Mapeos Mac\u2192Win")
+            self._adv_btn.configure(text="\u25b8 Avanzado")
             self._adv_open = False
         else:
             self._adv_frame.pack(fill=tk.X, after=self._adv_btn.master)
-            self._adv_btn.configure(text="\u25be Mapeos Mac\u2192Win")
+            self._adv_btn.configure(text="\u25be Avanzado")
             self._adv_open = True
 
     def _add_map(self):
@@ -805,6 +841,23 @@ class App:
         sel = self.map_list.curselection()
         if sel:
             self.map_list.delete(sel[0])
+
+    def _browse_search_root(self):
+        p = filedialog.askdirectory(
+            title="Carpeta adicional para buscar archivos offline")
+        if p:
+            self.search_root_var.set(p)
+
+    def _add_search_root(self):
+        val = self.search_root_var.get().strip()
+        if val:
+            self.search_root_list.insert(tk.END, val)
+            self.search_root_var.set("")
+
+    def _rm_search_root(self):
+        sel = self.search_root_list.curselection()
+        if sel:
+            self.search_root_list.delete(sel[0])
 
     # ── Checkboxes ─────────────────────────────────────────
 
@@ -1030,6 +1083,10 @@ class App:
         dry = self.dry_var.get()
         auto_seq = self.auto_seq_var.get()
         raw_maps = [self.map_list.get(i) for i in range(self.map_list.size())]
+        search_roots = [
+            Path(self.search_root_list.get(i))
+            for i in range(self.search_root_list.size())
+        ]
 
         try:
             mappings = parse_path_mappings(raw_maps) if raw_maps else []
@@ -1077,11 +1134,12 @@ class App:
 
         threading.Thread(
             target=self._worker,
-            args=(projects, out, dry, auto_seq, mappings),
+            args=(projects, out, dry, auto_seq, mappings, search_roots),
             daemon=True,
         ).start()
 
-    def _worker(self, projects, out_name, dry_run, auto_seq, mappings):
+    def _worker(self, projects, out_name, dry_run, auto_seq, mappings,
+                search_roots):
         logger = logging.getLogger("premiere_gui")
         logger.setLevel(logging.INFO)
         logger.handlers.clear()
@@ -1129,6 +1187,7 @@ class App:
                     path_mappings=mappings,
                     log=logger,
                     sequence_callback=seq_cb,
+                    extra_search_roots=search_roots,
                 )
 
                 copied = stats.get("copied", 0)

@@ -893,9 +893,14 @@ class FileIndex:
         if exclude_folder:
             skip = skip | {exclude_folder.lower()}
 
+        self._skip = skip
+        self._walk_root(project_root)
+
+    def _walk_root(self, root: Path) -> None:
+        """Indexa todos los archivos bajo *root*."""
         try:
-            for dirpath, dirnames, filenames in os.walk(project_root):
-                dirnames[:] = [d for d in dirnames if d.lower() not in skip]
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d.lower() not in self._skip]
                 for fname in filenames:
                     full = Path(dirpath) / fname
                     key = unicodedata.normalize("NFC", fname).lower()
@@ -904,6 +909,26 @@ class FileIndex:
                         self.ae_projects.add(str(full))
         except OSError:
             pass
+
+    def add_roots(self, roots: list[Path], log: logging.Logger) -> None:
+        """Indexa directorios adicionales de busqueda."""
+        for root in roots:
+            if not root.is_dir():
+                log.warning("  Raiz de busqueda no encontrada: %s", root)
+                continue
+            # Evitar re-indexar si ya esta contenida en la raiz principal
+            try:
+                root.relative_to(self._root)
+                continue  # ya indexado
+            except ValueError:
+                pass
+            before = sum(len(v) for v in self._by_name.values())
+            self._walk_root(root)
+            after = sum(len(v) for v in self._by_name.values())
+            added = after - before
+            if added:
+                log.info("  Raiz de busqueda adicional: %s (+%d archivos)",
+                         root, added)
 
     @staticmethod
     def _suffix_score(original: Path, candidate: Path) -> int:
@@ -1067,6 +1092,7 @@ def package_project(
     path_mappings: list[tuple[str, str]],
     log: logging.Logger,
     sequence_callback=None,
+    extra_search_roots: list[Path] | None = None,
 ) -> dict:
     """Empaqueta un proyecto .prproj individual."""
     stats = {"copied": 0, "missing": 0, "skipped": 0, "errors": []}
@@ -1162,6 +1188,9 @@ def package_project(
 
     # --- Construir indice de archivos (un solo os.walk) ---
     file_index = FileIndex(dest_root, _AE_SKIP_DIRS, exclude_folder=folder_name)
+    if extra_search_roots:
+        file_index.add_roots(
+            [Path(r) for r in extra_search_roots], log)
 
     # --- Incluir proyectos After Effects del arbol del proyecto ---
     if file_index.ae_projects:
@@ -1458,6 +1487,15 @@ def main():
         action="store_true",
         help="Incluir carpetas 'Adobe Premiere Pro Auto-Save' (omitidas por defecto)",
     )
+    parser.add_argument(
+        "--search",
+        action="append",
+        metavar="RUTA",
+        help=(
+            "Directorio adicional donde buscar archivos offline.\n"
+            "Se puede repetir: --search V:\\AEDAS --search D:\\Dropbox"
+        ),
+    )
 
     args = parser.parse_args()
     log = setup_logging()
@@ -1518,6 +1556,12 @@ def main():
         log.info("  Mapeos Mac->Win:")
         for mac, win in path_mappings:
             log.info("    %s  ->  %s", mac, win)
+
+    search_roots = [Path(s) for s in (args.search or [])]
+    if search_roots:
+        log.info("  Busqueda adicional:")
+        for sr in search_roots:
+            log.info("    %s", sr)
     log.info("")
 
     # Procesar
@@ -1532,6 +1576,7 @@ def main():
             prproj, args.destino, folder_name,
             args.dry_run, mode, args.sequence,
             path_mappings, log,
+            extra_search_roots=search_roots,
         )
 
         totals["copied"] += stats["copied"]
