@@ -819,6 +819,31 @@ _RE_AE_WIN_PATH = re.compile(
 _RE_AE_MAC_PATH = re.compile(
     r'(?<!:)(/(?:Volumes|Users)/[^\x00-\x1f\ufffd]+\.\w{2,10})(?=[^\w.]|$)')
 
+# Patron para detectar rutas que son ruido binario: multiples caracteres no-ASCII
+# seguidos o rutas con demasiados componentes (>15 niveles de profundidad).
+_RE_BINARY_NOISE = re.compile(r'[\x80-\ufffc]{3,}')
+
+
+def _is_plausible_path(p: str) -> bool:
+    """Filtra falsos positivos del escaneo binario de AE.
+
+    Descarta rutas que probablemente son basura binaria decodificada:
+    - Contienen secuencias de caracteres no-ASCII (ruido binario)
+    - Tienen mas de 15 niveles de profundidad
+    - Contienen caracteres de control embebidos
+    """
+    if _RE_BINARY_NOISE.search(p):
+        return False
+    # Profundidad razonable (los proyectos reales rara vez pasan de 10)
+    parts = p.replace("\\", "/").split("/")
+    if len(parts) > 15:
+        return False
+    # El nombre del archivo debe tener al menos 2 caracteres antes de la extension
+    name = Path(p).stem
+    if len(name) < 2:
+        return False
+    return True
+
 
 def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
     """Escanea un proyecto After Effects (.aep/.aepx) buscando rutas de footage.
@@ -854,7 +879,8 @@ def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
         p = m.group(1)
         if len(p) <= 500 and p != exclude:
             try:
-                if Path(p).suffix.lower() in _AE_FOOTAGE_EXTENSIONS:
+                if (Path(p).suffix.lower() in _AE_FOOTAGE_EXTENSIONS
+                        and _is_plausible_path(p)):
                     paths.add(p)
             except Exception:
                 pass
@@ -863,7 +889,8 @@ def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
         p = m.group(1)
         if len(p) <= 500 and p != exclude:
             try:
-                if Path(p).suffix.lower() in _AE_FOOTAGE_EXTENSIONS:
+                if (Path(p).suffix.lower() in _AE_FOOTAGE_EXTENSIONS
+                        and _is_plausible_path(p)):
                     paths.add(p)
             except Exception:
                 pass
@@ -896,7 +923,7 @@ class FileIndex:
         self._skip = skip
         self._walk_root(project_root)
 
-    def _walk_root(self, root: Path) -> None:
+    def _walk_root(self, root: Path, collect_ae: bool = True) -> None:
         """Indexa todos los archivos bajo *root*."""
         try:
             for dirpath, dirnames, filenames in os.walk(root):
@@ -905,13 +932,17 @@ class FileIndex:
                     full = Path(dirpath) / fname
                     key = unicodedata.normalize("NFC", fname).lower()
                     self._by_name.setdefault(key, []).append(full)
-                    if Path(fname).suffix.lower() in AE_PROJECT_EXTENSIONS:
+                    if collect_ae and Path(fname).suffix.lower() in AE_PROJECT_EXTENSIONS:
                         self.ae_projects.add(str(full))
         except OSError:
             pass
 
     def add_roots(self, roots: list[Path], log: logging.Logger) -> None:
-        """Indexa directorios adicionales de busqueda."""
+        """Indexa directorios adicionales para resolucion de archivos offline.
+
+        Solo anade al indice de nombres para busqueda; NO recolecta proyectos
+        After Effects (esos solo se descubren desde la raiz del proyecto).
+        """
         for root in roots:
             if not root.is_dir():
                 log.warning("  Raiz de busqueda no encontrada: %s", root)
@@ -923,7 +954,7 @@ class FileIndex:
             except ValueError:
                 pass
             before = sum(len(v) for v in self._by_name.values())
-            self._walk_root(root)
+            self._walk_root(root, collect_ae=False)
             after = sum(len(v) for v in self._by_name.values())
             added = after - before
             if added:
@@ -1192,10 +1223,13 @@ def package_project(
         file_index.add_roots(
             [Path(r) for r in extra_search_roots], log)
 
-    # --- Incluir proyectos After Effects del arbol del proyecto ---
-    if file_index.ae_projects:
-        log.info("  Proyectos After Effects en carpeta: %d", len(file_index.ae_projects))
-        target_paths.update(file_index.ae_projects)
+    # --- Proyectos After Effects referenciados por la secuencia ---
+    ae_in_sequence = {
+        p for p in target_paths
+        if Path(p).suffix.lower() in AE_PROJECT_EXTENSIONS
+    }
+    if ae_in_sequence:
+        log.info("  Proyectos After Effects en secuencia: %d", len(ae_in_sequence))
 
     # --- Expandir con dependencias de After Effects ---
     ae_extra = _expand_ae_dependencies(target_paths, path_mappings, log, file_index)
