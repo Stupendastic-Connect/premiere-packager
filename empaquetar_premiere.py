@@ -511,9 +511,10 @@ class PrprojGraph:
 
         return needed_ids, needed_uids
 
-    def trim_to_sequence(self, seq: ET.Element, log: logging.Logger) -> int:
-        """Elimina del XML todos los objetos que no son alcanzables desde la
-        secuencia seleccionada. Simula el comportamiento del Project Manager
+    def trim_to_sequence(self, seqs: ET.Element | list[ET.Element],
+                         log: logging.Logger) -> int:
+        """Elimina del XML todos los objetos que no son alcanzables desde la(s)
+        secuencia(s) seleccionada(s). Simula el comportamiento del Project Manager
         de Premiere ('Collect Files' para una secuencia).
 
         Mantiene la infraestructura del proyecto (settings, bins) para que
@@ -531,8 +532,9 @@ class PrprojGraph:
             "WorkspaceSettings",
         }
 
-        # BFS desde la secuencia: encontrar todo lo alcanzable
-        needed_ids, needed_uids = self.collect_reachable([seq])
+        # BFS desde la(s) secuencia(s): encontrar todo lo alcanzable
+        start = seqs if isinstance(seqs, list) else [seqs]
+        needed_ids, needed_uids = self.collect_reachable(start)
 
         # Eliminar elementos top-level no alcanzables
         to_remove = []
@@ -1152,7 +1154,7 @@ def package_project(
     graph = PrprojGraph(root)
 
     # --- Determinar medios a copiar ---
-    selected_seq = None  # secuencia elegida (para limpiar el XML)
+    selected_seqs: list[ET.Element] = []  # secuencia(s) elegida(s) (para limpiar XML)
 
     if mode == "all":
         # Modo legacy: copiar todos los medios del proyecto
@@ -1211,6 +1213,7 @@ def package_project(
             log.info("  Secuencia(s): %s", ", ".join(names))
 
             # Recolectar medios de todas las secuencias seleccionadas
+            selected_seqs = [sel["element"] for sel in selected_list]
             target_paths: set[str] = set()
             for sel in selected_list:
                 target_paths |= graph.collect_media_for_sequence(sel["element"])
@@ -1219,6 +1222,13 @@ def package_project(
 
     # --- Construir indice de archivos (un solo os.walk) ---
     file_index = FileIndex(dest_root, _AE_SKIP_DIRS, exclude_folder=folder_name)
+
+    # Agregar el directorio fuente del .prproj como raiz de busqueda.
+    # En GUI dest_root ya ES la raiz del proyecto (no-op), pero en CLI
+    # dest_root es el directorio de backup, asi que el arbol fuente no
+    # estaria indexado sin esta linea.
+    file_index.add_roots([prproj_path.parent], log)
+
     if extra_search_roots:
         file_index.add_roots(
             [Path(r) for r in extra_search_roots], log)
@@ -1415,11 +1425,11 @@ def package_project(
                     else:
                         log.info("%s|-- %s/", indent, parts[depth])
 
-    # --- Limpiar XML: solo la secuencia seleccionada y sus dependencias ---
-    if selected_seq is not None:
+    # --- Limpiar XML: solo la(s) secuencia(s) seleccionada(s) y sus dependencias ---
+    if selected_seqs:
         if dry_run:
             # Calcular cuantos se eliminarian sin modificar el arbol
-            needed_ids, needed_uids = graph.collect_reachable([selected_seq])
+            needed_ids, needed_uids = graph.collect_reachable(selected_seqs)
             keep_tags = {
                 "Project", "ProjectSettings", "ScratchDiskSettings",
                 "IngestSettings", "WorkspaceSettings", "DummyCaptureSettings",
@@ -1436,7 +1446,7 @@ def package_project(
             )
             log.info("  [DRY-RUN] Eliminaria %d objetos del XML", removable)
         else:
-            graph.trim_to_sequence(selected_seq, log)
+            graph.trim_to_sequence(selected_seqs, log)
 
     # --- Reescribir rutas de medios copiados en el XML ---
     # Solo reescribir archivos que se copiaron (no offline).
