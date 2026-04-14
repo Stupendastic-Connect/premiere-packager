@@ -555,16 +555,16 @@ class App:
         for dm in default_maps:
             if dm not in saved_maps:
                 self.map_list.insert(tk.END, dm)
-        default_search_roots = [
-            "V:\\",
-            "Z:\\DATA\\PROYECTOS",
-        ]
+        # Los search roots ahora son opcionales: el motor auto-descubre
+        # directorios de busqueda a partir de las rutas offline del .prproj.
+        # Solo agregar roots manuales si el usuario los configuro.
         saved_roots = c.get("search_roots", [])
+        # Migrar: eliminar los defaults amplios que ya no hacen falta
+        _broad = {"V:\\", "Z:\\DATA\\PROYECTOS", "V:/", "Z:/DATA/PROYECTOS"}
         for sr in saved_roots:
+            if sr in _broad:
+                continue
             self.search_root_list.insert(tk.END, sr)
-        for dr in default_search_roots:
-            if dr not in saved_roots:
-                self.search_root_list.insert(tk.END, dr)
         if c.get("geo"):
             try:
                 self.root.geometry(c["geo"])

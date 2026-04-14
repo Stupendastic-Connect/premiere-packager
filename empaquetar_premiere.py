@@ -1295,6 +1295,31 @@ def package_project(
     # estaria indexado sin esta linea.
     file_index.add_roots([prproj_path.parent], log)
 
+    # --- Auto-descubrir directorios de archivos offline ---
+    # En vez de caminar drives enteros (V:\, Z:\), derivar las carpetas
+    # de busqueda a partir de las rutas de medios que no existen en disco.
+    # Para cada ruta offline, buscar el ancestro mas cercano que exista
+    # y agregarlo como raiz de busqueda (max 3 niveles arriba).
+    auto_roots: set[str] = set()
+    for orig in target_paths:
+        normalized = normalize_media_path(orig)
+        translated = translate_path(normalized, path_mappings)
+        src = Path(translated)
+        if src.exists():
+            continue
+        # Subir hasta encontrar un directorio que exista
+        parent = src.parent
+        for _ in range(3):
+            if parent == parent.parent:
+                break
+            if parent.is_dir():
+                auto_roots.add(str(parent))
+                break
+            parent = parent.parent
+
+    if auto_roots:
+        file_index.add_roots([Path(r) for r in sorted(auto_roots)], log)
+
     if extra_search_roots:
         file_index.add_roots(
             [Path(r) for r in extra_search_roots], log)

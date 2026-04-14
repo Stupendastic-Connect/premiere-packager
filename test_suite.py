@@ -1606,6 +1606,39 @@ def test_package_project_trim_dry_run_reports():
         test_log.removeHandler(handler)
 
 
+def test_package_project_auto_discover_roots():
+    """Archivos offline cuya carpeta padre existe se descubren automaticamente
+    sin necesidad de search roots manuales."""
+    print("\n=== Test: package_project auto-discover roots ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        project = root / "AEDAS" / "Veranda"
+        project.mkdir(parents=True)
+        dest = root / "Backup"
+        dest.mkdir()
+
+        # .prproj referencia un archivo en OTRO proyecto del mismo NAS
+        other_project = root / "AEDAS" / "OtroProyecto" / "Material"
+        other_project.mkdir(parents=True)
+        cross_file = other_project / "entrevista.mov"
+        cross_file.write_text("cross-project media")
+
+        xml_str = build_simple_prproj(
+            [str(cross_file)], seq_name="Main")
+        prproj = write_test_prproj(project, xml_str, "test.prproj")
+
+        # SIN search roots manuales — el auto-discover debe encontrarlo
+        stats = package_project(
+            prproj_path=prproj, dest_root=dest, folder_name="test",
+            dry_run=True, mode="auto", sequence_pattern=None,
+            path_mappings=[], log=log,
+            extra_search_roots=None,
+        )
+
+        check("auto-discover resuelve cross-project", stats["copied"], 1)
+        check("0 missing", stats["missing"], 0)
+
+
 def test_package_project_empty_media():
     """Proyecto con secuencia sin medios (vacia) se maneja correctamente."""
     print("\n=== Test: package_project secuencia vacia ===")
@@ -1716,6 +1749,7 @@ if __name__ == "__main__":
     test_package_project_relative_paths_in_output()
     test_package_project_trim_xml()
     test_package_project_trim_dry_run_reports()
+    test_package_project_auto_discover_roots()
     test_package_project_empty_media()
 
     print(f"\n{'=' * 60}")
