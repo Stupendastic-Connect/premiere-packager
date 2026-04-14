@@ -959,6 +959,40 @@ class FileIndex:
         except OSError:
             pass
 
+    def _walk_root_excluding(self, root: Path, exclude: Path) -> None:
+        """Indexa *root* pero salta el subarbol *exclude* (ya indexado)."""
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dp = Path(dirpath)
+                # Si estamos dentro del subarbol excluido, podar
+                try:
+                    dp.relative_to(exclude)
+                    dirnames.clear()
+                    continue
+                except ValueError:
+                    pass
+                # Podar el directorio excluido para no descender a el
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d.lower() not in self._skip
+                    and not self._is_subpath(dp / d, exclude)
+                ]
+                for fname in filenames:
+                    full = dp / fname
+                    key = unicodedata.normalize("NFC", fname).lower()
+                    self._by_name.setdefault(key, []).append(full)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _is_subpath(candidate: Path, target: Path) -> bool:
+        """True si target esta contenido en (o es igual a) candidate."""
+        try:
+            target.relative_to(candidate)
+            return True
+        except ValueError:
+            return False
+
     def add_roots(self, roots: list[Path], log: logging.Logger) -> None:
         """Indexa directorios adicionales para resolucion de archivos offline.
 
@@ -973,6 +1007,18 @@ class FileIndex:
             try:
                 root.relative_to(self._root)
                 continue  # ya indexado
+            except ValueError:
+                pass
+            # Evitar caminar un root que CONTIENE la raiz principal.
+            # Ej: root=V:\ y self._root=V:\AEDAS\Proyecto → caminar V:\
+            # entero es redundante (ya tenemos V:\AEDAS\Proyecto indexado)
+            # y extremadamente lento en un NAS.  Solo indexar lo que falta.
+            try:
+                self._root.relative_to(root)
+                # root contiene self._root → caminar root EXCLUYENDO self._root
+                log.info("  Raiz de busqueda %s contiene proyecto, escaneando sin duplicar...", root)
+                self._walk_root_excluding(root, self._root)
+                continue
             except ValueError:
                 pass
             before = sum(len(v) for v in self._by_name.values())

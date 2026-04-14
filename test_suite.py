@@ -863,6 +863,36 @@ def test_file_index_mixed_extra_roots_disambiguation():
                         "Camara1" in str(result))
 
 
+def test_file_index_parent_root_no_duplicate():
+    """add_roots con V:\\ cuando self._root es V:\\AEDAS\\Proyecto no re-indexa
+    el subarbol del proyecto, pero SI indexa el resto del drive."""
+    print("\n=== Test: FileIndex parent root no duplica proyecto ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        drive = Path(tmp)
+        # Simular: V:\AEDAS\Proyecto (ya indexado como root)
+        project = drive / "AEDAS" / "Proyecto"
+        (project / "Media").mkdir(parents=True)
+        (project / "Media" / "clip.mov").write_text("proj")
+
+        # Simular: V:\OtroCliente\Footage (fuera del proyecto)
+        (drive / "OtroCliente" / "Footage").mkdir(parents=True)
+        (drive / "OtroCliente" / "Footage" / "external.mov").write_text("ext")
+
+        # FileIndex con root = proyecto
+        idx = FileIndex(project)
+        check("clip.mov indexado", len(idx._by_name.get("clip.mov", [])), 1)
+        check("external.mov NO indexado aun",
+              len(idx._by_name.get("external.mov", [])), 0)
+
+        # add_roots con el "drive" completo (contiene self._root)
+        idx.add_roots([drive], log)
+
+        # external.mov ahora SI esta
+        check("external.mov indexado", len(idx._by_name.get("external.mov", [])), 1)
+        # clip.mov NO debe estar duplicado (el subarbol proyecto se excluyo)
+        check("clip.mov no duplicado", len(idx._by_name.get("clip.mov", [])), 1)
+
+
 def test_file_index_exclude_folder():
     """exclude_folder filtra archivos del destino de empaquetado."""
     print("\n=== Test: FileIndex exclude_folder ===")
@@ -1648,6 +1678,7 @@ if __name__ == "__main__":
     test_file_index_with_path_translation()
     test_file_index_unicode_nfd_from_mac()
     test_file_index_mixed_extra_roots_disambiguation()
+    test_file_index_parent_root_no_duplicate()
     test_file_index_exclude_folder()
 
     # 5. After Effects
