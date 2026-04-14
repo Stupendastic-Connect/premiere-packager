@@ -33,6 +33,7 @@ import shutil
 import sys
 import unicodedata
 import xml.etree.ElementTree as ET
+from collections import deque
 from pathlib import Path, PurePosixPath
 
 # ---------------------------------------------------------------------------
@@ -467,25 +468,46 @@ class PrprojGraph:
 
     # --- Limpieza del XML: solo secuencia seleccionada ----------------------
 
+    def _ensure_ref_graph(self) -> None:
+        """Pre-construye el mapa de referencias salientes de cada elemento
+        top-level.  Se ejecuta una sola vez (lazy) y se reutiliza en cada
+        llamada a collect_reachable."""
+        if hasattr(self, "_outgoing"):
+            return
+        # _outgoing[python_id(elem)] = (set_of_ObjectRef, set_of_ObjectURef)
+        self._outgoing: dict[int, tuple[set[str], set[str]]] = {}
+        for elem in self.root:
+            refs: set[str] = set()
+            urefs: set[str] = set()
+            for desc in elem.iter():
+                r = desc.get("ObjectRef")
+                if r:
+                    refs.add(r)
+                ur = desc.get("ObjectURef")
+                if ur:
+                    urefs.add(ur)
+            self._outgoing[id(elem)] = (refs, urefs)
+
     def collect_reachable(self, start_elements: list[ET.Element]) -> tuple[set[str], set[str]]:
         """BFS desde los elementos iniciales, siguiendo todas las referencias
         ObjectRef/ObjectURef transitivamente.
 
         Retorna (set_de_ObjectIDs_necesarios, set_de_ObjectUIDs_necesarios).
         """
+        self._ensure_ref_graph()
+
         needed_ids: set[str] = set()
         needed_uids: set[str] = set()
-        queue = list(start_elements)
-        visited: set[int] = set()  # python id() de cada elemento
+        queue: deque[ET.Element] = deque(start_elements)
+        visited: set[int] = set()
 
         while queue:
-            elem = queue.pop(0)
+            elem = queue.popleft()
             py_id = id(elem)
             if py_id in visited:
                 continue
             visited.add(py_id)
 
-            # Registrar los IDs propios de este elemento
             oid = elem.get("ObjectID")
             if oid:
                 needed_ids.add(oid)
@@ -493,17 +515,15 @@ class PrprojGraph:
             if ouid:
                 needed_uids.add(ouid)
 
-            # Escanear todos los descendientes buscando referencias
-            for desc in elem.iter():
-                ref = desc.get("ObjectRef")
-                if ref and ref not in needed_ids:
+            refs, urefs = self._outgoing.get(py_id, (set(), set()))
+            for ref in refs:
+                if ref not in needed_ids:
                     needed_ids.add(ref)
                     target = self._by_id.get(ref)
                     if target is not None and id(target) not in visited:
                         queue.append(target)
-
-                uref = desc.get("ObjectURef")
-                if uref and uref not in needed_uids:
+            for uref in urefs:
+                if uref not in needed_uids:
                     needed_uids.add(uref)
                     target = self._by_uid.get(uref)
                     if target is not None and id(target) not in visited:
