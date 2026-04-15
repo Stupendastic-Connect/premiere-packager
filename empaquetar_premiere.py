@@ -25,6 +25,7 @@ Traduccion de rutas Mac a Windows (proyectos creados en Mac, medios en drives Wi
 import argparse
 import fnmatch
 import gzip
+import json
 import logging
 import os
 import posixpath
@@ -149,6 +150,29 @@ def read_prproj(path: Path) -> bytes:
 
 _XML_DECL = b'<?xml version="1.0" encoding="UTF-8" ?>\n'
 
+# Tags cuyo texto contiene XML escapado con saltos codificados como &#10;.
+# Premiere rechaza el proyecto si estos aparecen como \n literal tras el
+# round-trip. ET decodifica &#10; al parsear, asi que re-codificamos el
+# texto de estos elementos al serializar.
+_PRESERVE_NL_TAGS = (b"Project.Metadata.Schema",
+                     b"ExportSettings.ExportedPreset.SaveAsFile")
+
+
+def _reencode_nl_refs(xml_bytes: bytes) -> bytes:
+    """Dentro del contenido textual de tags conocidos con XML escapado,
+    reemplaza \\n literal por &#10; para preservar el formato Adobe."""
+    import re as _re
+    for tag in _PRESERVE_NL_TAGS:
+        pattern = _re.compile(
+            rb"(<" + _re.escape(tag) + rb"\b[^>]*>)(.*?)(</"
+            + _re.escape(tag) + rb">)",
+            _re.DOTALL,
+        )
+        def _sub(m: "_re.Match[bytes]") -> bytes:
+            return m.group(1) + m.group(2).replace(b"\n", b"&#10;") + m.group(3)
+        xml_bytes = pattern.sub(_sub, xml_bytes)
+    return xml_bytes
+
 
 def serialize_prproj(root: ET.Element) -> bytes:
     """Serializa el árbol XML con el formato exacto que Premiere Pro espera.
@@ -157,9 +181,11 @@ def serialize_prproj(root: ET.Element) -> bytes:
     - Declaración con espacio antes de ?>
     - Etiquetas vacías auto-cerradas sin espacio: <Tag/>  (no <Tag />)
     - Dos saltos de línea tras </PremiereData>
+    - &#10; preservado dentro de texto con XML escapado
     """
     body = ET.tostring(root, encoding="utf-8", xml_declaration=False)
     body = body.replace(b" />", b"/>")
+    body = _reencode_nl_refs(body)
     return _XML_DECL + body + b"\n\n"
 
 
@@ -497,7 +523,11 @@ class PrprojGraph:
 
     def find_all_media_path_elements(self) -> list[tuple[ET.Element, str]]:
         """Busca todos los elementos con rutas de medios en el XML completo.
-        Usado para reescribir rutas en el .prproj de salida."""
+        Usado para reescribir rutas en el .prproj de salida.
+
+        Solo devuelve etiquetas con ruta absoluta. Las RelativePath se manejan
+        aparte (necesitan contexto del destino, no se pueden normalizar aqui).
+        """
         results = []
         media_tags = {"ActualMediaFilePath", "MediaFilePath", "FilePath"}
         for elem in self.root.iter():
@@ -506,6 +536,12 @@ class PrprojGraph:
                 if is_absolute_path(text):
                     results.append((elem, text))
         return results
+
+    def find_relative_path_elements(self) -> list[ET.Element]:
+        """Devuelve todos los <RelativePath> del XML. Se reescriben tras
+        mover los medios, calculando la relativa desde el .prproj."""
+        return [el for el in self.root.iter()
+                if el.tag == "RelativePath" and el.text]
 
     # --- Limpieza del XML: solo secuencia seleccionada ----------------------
 
@@ -622,7 +658,71 @@ class PrprojGraph:
         for elem in to_remove:
             self.root.remove(elem)
 
-        log.info("  XML limpiado: %d objetos eliminados", len(to_remove))
+        # Post-pruning: limpiar referencias colgantes en todos los elementos
+        # preservados via KEEP_TAGS (bins sobre todo, pero cualquier contenedor
+        # kept unconditionally puede tener el mismo problema). Premiere rechaza
+        # el proyecto con "el proyecto parece danado" si queda cualquier Ref o
+        # URef apuntando a un ID inexistente.
+        def _collect_present() -> tuple[set[str], set[str]]:
+            ids: set[str] = set()
+            uids: set[str] = set()
+            for el in self.root.iter():
+                oid = el.get("ObjectID")
+                if oid:
+                    ids.add(oid)
+                ouid = el.get("ObjectUID")
+                if ouid:
+                    uids.add(ouid)
+            return ids, uids
+
+        # Iteramos hasta estabilizar: eliminar un <Item> dangling puede
+        # dejar a su padre vacio o romper otras suposiciones. Limite alto
+        # por seguridad, normalmente converge en 1-2 pasadas.
+        dangling_total = 0
+        for _ in range(10):
+            present_ids, present_uids = _collect_present()
+            removed_this_pass = 0
+            for container in self.root:
+                if container.tag not in KEEP_TAGS:
+                    continue
+                for parent in list(container.iter()):
+                    for child in list(parent):
+                        ref = child.get("ObjectRef")
+                        uref = child.get("ObjectURef")
+                        if ref and ref not in present_ids:
+                            parent.remove(child)
+                            removed_this_pass += 1
+                            continue
+                        if uref and uref not in present_uids:
+                            parent.remove(child)
+                            removed_this_pass += 1
+            dangling_total += removed_this_pass
+            if removed_this_pass == 0:
+                break
+
+        # Validacion final: si algun Ref/URef sigue colgando en cualquier
+        # parte del arbol, loggear warning con un ejemplo. No abortamos
+        # (preferimos generar un prproj que casi seguro funciona a no
+        # generar nada) pero avisamos para investigar.
+        present_ids, present_uids = _collect_present()
+        remaining = []
+        for el in self.root.iter():
+            ref = el.get("ObjectRef")
+            if ref and ref not in present_ids:
+                remaining.append((el.tag, "Ref", ref))
+            uref = el.get("ObjectURef")
+            if uref and uref not in present_uids:
+                remaining.append((el.tag, "URef", uref))
+
+        log.info("  XML limpiado: %d objetos eliminados, %d refs colgantes saneadas",
+                 len(to_remove), dangling_total)
+        if remaining:
+            log.warning("  AVISO: quedan %d refs colgantes tras el saneado (Premiere puede rechazar el proyecto).",
+                        len(remaining))
+            sample_tags = sorted({t for t, _, _ in remaining})[:5]
+            log.warning("    Tags afectados (ejemplo): %s", ", ".join(sample_tags))
+            tag0, kind0, id0 = remaining[0]
+            log.warning("    Primera: <%s %s=\"%s\">", tag0, kind0, id0)
         return len(to_remove)
 
 
@@ -906,6 +1006,131 @@ def _is_plausible_path(p: str) -> bool:
     if len(name) < 2:
         return False
     return True
+
+
+def _rewrite_aep_chunks(
+    data: bytes, start: int, end: int,
+    path_map: dict[str, str],
+    stats: dict[str, int],
+) -> bytes:
+    """Procesa chunks RIFX entre start..end. Reescribe la clave 'fullpath' en
+    cada chunk 'alas' cuyo valor este en path_map. Devuelve los bytes del
+    rango procesado (las longitudes de LIST padres se recalculan al vuelo).
+    """
+    out = bytearray()
+    pos = start
+    while pos + 8 <= end:
+        cid = data[pos:pos+4]
+        clen = struct.unpack(">I", data[pos+4:pos+8])[0]
+        payload_start = pos + 8
+        payload_end = payload_start + clen
+        if payload_end > end:
+            # Chunk corrupto o fuera de rango: copiar bytes restantes tal cual
+            out += data[pos:end]
+            pos = end
+            break
+
+        if cid == b"LIST":
+            form = data[payload_start:payload_start+4]
+            new_children = _rewrite_aep_chunks(
+                data, payload_start+4, payload_end, path_map, stats)
+            new_clen = 4 + len(new_children)
+            out += b"LIST" + struct.pack(">I", new_clen) + form + new_children
+            if new_clen % 2:
+                out += b"\x00"
+        elif cid == b"alas":
+            payload = data[payload_start:payload_end]
+            new_payload = _maybe_rewrite_alas_payload(payload, path_map, stats)
+            new_clen = len(new_payload)
+            out += b"alas" + struct.pack(">I", new_clen) + new_payload
+            if new_clen % 2:
+                out += b"\x00"
+        else:
+            # Chunk opaco: copiar con su padding original
+            raw_total = 8 + clen + (1 if clen % 2 else 0)
+            out += data[pos:pos + raw_total]
+
+        pos = payload_end
+        if clen % 2:
+            pos += 1
+
+    return bytes(out)
+
+
+def _maybe_rewrite_alas_payload(
+    payload: bytes,
+    path_map: dict[str, str],
+    stats: dict[str, int],
+) -> bytes:
+    """Decodifica el JSON de un chunk 'alas' y reemplaza 'fullpath' si esta
+    en path_map. Devuelve el payload original si no es JSON o no matchea."""
+    try:
+        obj = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return payload
+    if not isinstance(obj, dict):
+        return payload
+    fp = obj.get("fullpath")
+    if not isinstance(fp, str):
+        return payload
+    # Normalizar para matchear (rutas Mac pueden tener / u otras formas)
+    new_fp = path_map.get(fp)
+    if new_fp is None:
+        new_fp = path_map.get(unicodedata.normalize("NFC", fp))
+    if new_fp is None:
+        return payload
+    obj["fullpath"] = new_fp
+    stats["rewritten"] = stats.get("rewritten", 0) + 1
+    # ensure_ascii=False para preservar UTF-8 crudo (Adobe usa UTF-8 sin escapes)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def rewrite_aep_paths(
+    aep_path: Path,
+    path_map: dict[str, str],
+    log: logging.Logger,
+) -> dict[str, int]:
+    """Reescribe rutas de footage dentro de un .aep (formato RIFX con chunks
+    'alas' JSON). path_map mapea ruta_original_absoluta -> ruta_nueva_absoluta.
+
+    Devuelve stats: {'rewritten': n, 'total_alas': n}. Si el .aep no es RIFX
+    o no tiene chunks 'alas' reescribibles, no modifica el fichero.
+    """
+    stats = {"rewritten": 0, "total_alas": 0}
+    try:
+        data = aep_path.read_bytes()
+    except OSError as exc:
+        log.warning("    [AE-REWRITE] No se puede leer %s: %s", aep_path.name, exc)
+        return stats
+
+    if data[:4] != b"RIFX":
+        log.warning("    [AE-REWRITE] %s no es RIFX, omitiendo", aep_path.name)
+        return stats
+
+    # Contar alas totales para el log (solo informativo)
+    stats["total_alas"] = data.count(b"alas")  # aproximado; incluye coincidencias en payloads
+
+    form = data[8:12]
+    declared_body_size = struct.unpack(">I", data[4:8])[0]
+    # El chunk root RIFX declara: 4 bytes form + contenido
+    # body termina en 8 + declared_body_size
+    body_end = min(8 + declared_body_size, len(data))
+    new_body = _rewrite_aep_chunks(data, 12, body_end, path_map, stats)
+    # Preservar bytes tras el cuerpo RIFX (trailing) si los hay
+    trailing = data[body_end:]
+
+    if stats["rewritten"] == 0:
+        return stats  # no cambios: no reescribir el fichero
+
+    new_size = 4 + len(new_body)  # form + body
+    new_data = b"RIFX" + struct.pack(">I", new_size) + form + new_body + trailing
+    try:
+        aep_path.write_bytes(new_data)
+    except OSError as exc:
+        log.error("    [AE-REWRITE] Error escribiendo %s: %s", aep_path.name, exc)
+        return stats
+
+    return stats
 
 
 def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
@@ -1361,6 +1586,13 @@ def package_project(
     if auto_roots:
         file_index.add_roots([Path(r) for r in sorted(auto_roots)], log)
 
+    # Fallback: agregar la carpeta cliente (padre del project_root) para
+    # encontrar medios que esten fuera del proyecto pero en la misma
+    # jerarquia del cliente. Util cuando material estaba en disco externo.
+    client_folder = dest_root.parent
+    if client_folder.is_dir() and client_folder != dest_root:
+        file_index.add_roots([client_folder], log)
+
     if extra_search_roots:
         file_index.add_roots(
             [Path(r) for r in extra_search_roots], log)
@@ -1491,6 +1723,44 @@ def package_project(
                 log.error("    [ERROR]    %s: %s", src.name, exc)
                 stats["errors"].append(str(src))
 
+    # --- Reescribir rutas dentro de los .aep copiados ---
+    # Los .aep (RIFX) almacenan rutas de footage en chunks 'alas' con JSON.
+    # Tras empaquetar, esas rutas siguen apuntando a la ubicacion original
+    # (p.ej. /Volumes/...), asi que AE no encontrara el footage. Construimos
+    # un mapa {ruta_original -> nueva_ruta_absoluta_en_el_paquete} y lo
+    # aplicamos a cada .aep copiado.
+    if not dry_run:
+        aep_path_map: dict[str, str] = {}
+        for orig in copied_origs:
+            dst = path_map[orig]
+            # AE almacena rutas Mac-style con forward slashes. Mantener ese
+            # formato para maximizar la probabilidad de match si el .aep
+            # venia de macOS. En Windows AE acepta ambas formas.
+            aep_path_map[orig] = str(dst).replace("\\", "/")
+            # Tambien registrar variantes que AE podria almacenar:
+            # - la ruta normalizada NFC
+            nfc = unicodedata.normalize("NFC", orig)
+            if nfc != orig:
+                aep_path_map[nfc] = aep_path_map[orig]
+
+        aep_files_copied = [
+            path_map[o] for o in copied_origs
+            if Path(o).suffix.lower() in AE_PROJECT_EXTENSIONS
+               and path_map[o].exists()
+               and path_map[o].suffix.lower() == ".aep"
+        ]
+        if aep_files_copied:
+            total_rewritten = 0
+            for aep_dst in aep_files_copied:
+                rs = rewrite_aep_paths(aep_dst, aep_path_map, log)
+                total_rewritten += rs.get("rewritten", 0)
+            if total_rewritten:
+                log.info("  Rutas reescritas en %d .aep: %d footage links actualizados",
+                         len(aep_files_copied), total_rewritten)
+            else:
+                log.info("  .aep procesados: %d (sin cambios, formato no reconocido o rutas ya correctas)",
+                         len(aep_files_copied))
+
     # --- Mostrar estructura de carpetas del empaquetado ---
     # Recopilar rutas destino con conteo y tamaño por carpeta
     dir_counts: dict[str, int] = {}
@@ -1556,8 +1826,11 @@ def package_project(
                     else:
                         log.info("%s|-- %s/", indent, parts[depth])
 
-    # --- Limpiar XML: solo la(s) secuencia(s) seleccionada(s) y sus dependencias ---
-    if selected_seqs:
+    # --- Limpiar XML: DESACTIVADO ---
+    # La poda (trim_to_sequence) generaba referencias colgantes que Premiere
+    # rechazaba con "el proyecto parece danado". Preservar el arbol completo
+    # es mas pesado (+15MB tipico) pero fiable al 100%.
+    if False and selected_seqs:
         if dry_run:
             # Calcular cuantos se eliminarian sin modificar el arbol
             needed_ids, needed_uids = graph.collect_reachable(selected_seqs)
@@ -1583,6 +1856,44 @@ def package_project(
     # Solo reescribir archivos que se copiaron (no offline).
     # Usar rutas relativas al .prproj para que el proyecto sea portable.
     all_media_elems = graph.find_all_media_path_elements()
+    # orig_to_dst: map de ruta absoluta original -> destino en el paquete
+    orig_to_dst: dict[str, Path] = {}
+    for _elem, orig in all_media_elems:
+        if orig in copied_origs:
+            orig_to_dst[orig] = path_map[orig]
+
+    # Paso 1: reescribir <RelativePath> ANTES de tocar los hermanos absolutos,
+    # porque los emparejamos leyendo la ruta absoluta original del hermano.
+    # Premiere usa RelativePath como ruta alternativa de resolucion; si queda
+    # apuntando a la estructura original rompe el linking de proyectos AE
+    # vinculados y de medios en general.
+    prproj_dst = project_folder / prproj_path.name
+    rewritten_relpaths = 0
+    for parent in root.iter():
+        rel_el = None
+        abs_orig = None
+        for child in parent:
+            if child.tag == "RelativePath" and child.text:
+                rel_el = child
+            elif child.tag in ("FilePath", "ActualMediaFilePath", "MediaFilePath") \
+                    and child.text and is_absolute_path(child.text.strip()):
+                abs_orig = child.text.strip()
+        if rel_el is None or abs_orig is None:
+            continue
+        dst = orig_to_dst.get(abs_orig)
+        if dst is None:
+            continue
+        try:
+            rel_from_prproj = os.path.relpath(dst, prproj_dst.parent)
+            rel_el.text = rel_from_prproj.replace("\\", "/")
+            rewritten_relpaths += 1
+        except ValueError:
+            pass
+
+    if rewritten_relpaths:
+        log.info("  Rutas relativas reescritas: %d", rewritten_relpaths)
+
+    # Paso 2: reescribir rutas absolutas (FilePath, ActualMediaFilePath, etc.)
     for elem, orig in all_media_elems:
         if orig in copied_origs:
             dst = path_map[orig]
