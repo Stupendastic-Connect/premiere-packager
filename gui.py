@@ -237,6 +237,8 @@ class App:
         self._scan_id: str | None = None
         self._scanning = False
         self._scan_cancel = False
+        self._scan_gen = 0
+        self._root_to_iid: dict[str, str] = {}
         self._timer_id: str | None = None
         self._start_time: float = 0
 
@@ -602,6 +604,7 @@ class App:
 
     def _scan(self):
         self._scan_id = None
+        self._scan_gen += 1
         # Re-attach detached items before deleting
         for iid in list(self._detached):
             try:
@@ -614,6 +617,7 @@ class App:
         self.projects.clear()
         self._checked.clear()
         self._all_iids.clear()
+        self._root_to_iid.clear()
         self.search_var.set("")
 
         src = self.src_var.get().strip().strip('"').strip("'")
@@ -651,24 +655,35 @@ class App:
         self.count_var.set("Buscando proyectos\u2026")
         self.progress_label.set("Escaneando\u2026")
         self._update_btn()
+        gen = self._scan_gen
         include_autosave = self.autosave_var.get()
         out_name = self.out_var.get().strip()
+        skip_done = self.skip_done_var.get()
         threading.Thread(
             target=self._scan_worker,
-            args=(base, include_autosave, out_name),
+            args=(base, include_autosave, out_name, skip_done, gen),
             daemon=True,
         ).start()
 
-    def _scan_worker(self, base: Path, include_autosave: bool, out_name: str):
-        """Hilo que escanea .prproj con os.walk y poda de directorios."""
-        found: list[Path] = []
+    def _scan_worker(self, base: Path, include_autosave: bool, out_name: str,
+                     skip_done: bool, gen: int):
+        """Hilo que escanea .prproj y envia resultados a la UI progresivamente."""
+        from collections import OrderedDict
         base_str = str(base)
         skip_dirs = _ARCHIVE_NAMES | {"node_modules", ".git", "__pycache__"}
         if out_name:
             skip_dirs.add(out_name.lower())
+
+        groups: OrderedDict[str, list[Path]] = OrderedDict()
+        sent_keys: set[str] = set()
+        pending: list[tuple[str, str, Path, bool]] = []
+        total_found = 0
+        skipped_done = 0
+        last_send = time.monotonic()
+
         try:
             for dirpath, dirnames, filenames in os.walk(base_str):
-                if self._scan_cancel:
+                if self._scan_cancel or self._scan_gen != gen:
                     return
                 dirnames[:] = [
                     d for d in dirnames
@@ -678,81 +693,96 @@ class App:
                 ]
                 for fname in filenames:
                     if fname.lower().endswith(".prproj"):
-                        found.append(Path(dirpath, fname))
-                        if len(found) % 5 == 0:
-                            self.root.after(0, self._scan_progress, len(found))
+                        p = Path(dirpath, fname)
+                        total_found += 1
+                        proj_root = _find_project_root(p)
+                        key = str(proj_root)
+                        groups.setdefault(key, []).append(p)
+                        best = _pick_best_prproj(groups[key])
+
+                        if skip_done and out_name and (proj_root / out_name).is_dir():
+                            if key not in sent_keys:
+                                sent_keys.add(key)
+                                skipped_done += 1
+                            continue
+
+                        try:
+                            rel = str(best.relative_to(base))
+                        except ValueError:
+                            rel = best.name
+
+                        is_new = key not in sent_keys
+                        sent_keys.add(key)
+                        pending.append((key, rel, best, is_new))
+
+                        now = time.monotonic()
+                        if len(pending) >= 5 or (now - last_send) > 0.15:
+                            batch = list(pending)
+                            pending.clear()
+                            last_send = now
+                            tf, sd = total_found, skipped_done
+                            self.root.after(
+                                0, self._scan_add_batch, gen, batch, tf, sd)
         except OSError:
-            self.root.after(0, self._scan_finish, base, [])
-            return
-        found.sort()
-        self.root.after(0, self._scan_finish, base, found)
+            pass
 
-    def _scan_progress(self, n: int):
-        """Actualiza UI con progreso del escaneo (llamado en hilo principal)."""
-        if self._scan_cancel:
-            return
-        self.count_var.set(f"Buscando proyectos\u2026 {n} archivos .prproj")
-        self.progress_label.set(f"{n} encontrados")
+        if pending and not self._scan_cancel and self._scan_gen == gen:
+            self.root.after(
+                0, self._scan_add_batch, gen, list(pending),
+                total_found, skipped_done)
 
-    def _scan_finish(self, base: Path, found: list[Path]):
-        """Callback en hilo principal: agrupa, filtra y muestra resultados."""
+        if not self._scan_cancel and self._scan_gen == gen:
+            self.root.after(0, self._scan_done, gen, total_found, skipped_done)
+
+    def _scan_add_batch(self, gen: int,
+                        batch: list[tuple[str, str, Path, bool]],
+                        total_found: int, skipped_done: int):
+        """Agrega o actualiza proyectos en el arbol (hilo principal)."""
+        if self._scan_gen != gen:
+            return
+        query = self.search_var.get().strip().lower()
+        for key, rel, prproj, is_new in batch:
+            if is_new:
+                i = len(self.projects)
+                iid = str(i)
+                self.projects.append((rel, prproj))
+                self._checked[iid] = True
+                self._all_iids.append(iid)
+                self._root_to_iid[key] = iid
+                self.tree.insert("", tk.END, iid=iid,
+                                  values=("\u2611", rel, "Listo"),
+                                  tags=("pending",))
+                if query and query not in rel.lower():
+                    self.tree.detach(iid)
+                    self._detached.add(iid)
+            else:
+                iid = self._root_to_iid.get(key)
+                if iid:
+                    idx = int(iid)
+                    self.projects[idx] = (rel, prproj)
+                    check = "\u2611" if self._checked.get(iid, True) else "\u2610"
+                    self.tree.item(iid, values=(check, rel, "Listo"))
+
+        n = len(self.projects)
+        self.count_var.set(f"Buscando\u2026 {n} proyecto{'s' if n != 1 else ''}")
+        self.progress_label.set(f"{total_found} archivos")
+        self._update_btn()
+        if n == 1:
+            self._update_preview()
+
+    def _scan_done(self, gen: int, total_found: int, skipped_done: int):
+        """Callback final del escaneo (hilo principal)."""
+        if self._scan_gen != gen:
+            return
         self.pbar.stop()
         self.pbar.configure(mode="determinate", value=0)
         self.progress_label.set("")
         self._scanning = False
-        if self._scan_cancel:
-            return
 
-        self.count_var.set("Agrupando proyectos\u2026")
-
-        # Agrupar por proyecto (project root) y elegir el mejor .prproj
-        from collections import OrderedDict
-        groups: OrderedDict[str, list[Path]] = OrderedDict()
-        for p in found:
-            root = _find_project_root(p)
-            key = str(root)
-            groups.setdefault(key, []).append(p)
-
-        best: list[Path] = [_pick_best_prproj(g) for g in groups.values()]
-
-        # Filtrar proyectos ya empaquetados
-        skipped_done = 0
-        if self.skip_done_var.get():
-            out_name = self.out_var.get().strip()
-            if out_name:
-                filtered = []
-                for p in best:
-                    root = _find_project_root(p)
-                    if (root / out_name).is_dir():
-                        skipped_done += 1
-                    else:
-                        filtered.append(p)
-                best = filtered
-
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
-        self.projects.clear()
-        self._checked.clear()
-        self._all_iids.clear()
-
-        for i, prproj in enumerate(best):
-            try:
-                rel = str(prproj.relative_to(base))
-            except ValueError:
-                rel = prproj.name
-            iid = str(i)
-            self.projects.append((rel, prproj))
-            self._checked[iid] = True
-            self._all_iids.append(iid)
-            self.tree.insert("", tk.END, iid=iid,
-                              values=("\u2611", rel, "Listo"),
-                              tags=("pending",))
-
-        n = len(best)
-        total = len(found)
+        n = len(self.projects)
         parts = []
-        if total != n + skipped_done:
-            parts.append(f"de {total} archivos")
+        if total_found != n + skipped_done:
+            parts.append(f"de {total_found} archivos")
         if skipped_done:
             parts.append(f"{skipped_done} ya empaquetado{'s' if skipped_done != 1 else ''}")
         extra = f" ({', '.join(parts)})" if parts else ""
@@ -781,10 +811,7 @@ class App:
             n = sum(1 for iid in self._all_iids if self._checked.get(iid, True))
         if self.limit_var.get():
             n = min(n, LIMIT_N)
-        if self._scanning:
-            self.run_btn.configure(text="\u25b6  EMPAQUETAR")
-            self.run_btn.state(["disabled"])
-        elif n == 0:
+        if n == 0:
             self.run_btn.configure(text="\u25b6  EMPAQUETAR")
             self.run_btn.state(["disabled"])
         elif n == 1:
@@ -1031,6 +1058,15 @@ class App:
     def _run(self):
         if self.running:
             return
+        if self._scanning:
+            self._scan_cancel = True
+            self._scanning = False
+            self.pbar.stop()
+            self.pbar.configure(mode="determinate", value=0)
+            self.progress_label.set("")
+            n = len(self.projects)
+            self.count_var.set(
+                f"{n} proyecto{'s' if n != 1 else ''} (escaneo detenido)")
         if not self.projects:
             messagebox.showinfo(
                 "Sin proyectos",
