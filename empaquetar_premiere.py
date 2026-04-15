@@ -145,6 +145,19 @@ def read_prproj(path: Path) -> bytes:
     return raw
 
 
+_XML_DECL = b'<?xml version="1.0" encoding="UTF-8"?>\n'
+
+
+def serialize_prproj(root: ET.Element) -> bytes:
+    """Serializa el árbol XML con la declaración que Premiere Pro espera.
+
+    ET.tostring genera comillas simples y 'utf-8' en minúsculas, lo cual
+    Premiere rechaza como proyecto corrupto.
+    """
+    body = ET.tostring(root, encoding="utf-8", xml_declaration=False)
+    return _XML_DECL + body
+
+
 def write_prproj(path: Path, xml_bytes: bytes) -> None:
     """Comprime XML con gzip y lo guarda como .prproj."""
     with gzip.open(path, "wb") as f:
@@ -1341,8 +1354,7 @@ def package_project(
         log.info("  Sin medios que copiar.")
         if not dry_run:
             project_folder.mkdir(parents=True, exist_ok=True)
-            modified = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-            write_prproj(project_folder / prproj_path.name, modified)
+            write_prproj(project_folder / prproj_path.name, serialize_prproj(root))
         return stats
 
     # --- Traducir rutas Mac -> Windows y construir mapa ---
@@ -1557,8 +1569,7 @@ def package_project(
         log.info("  [GUARDARIA]  %s", project_folder / prproj_path.name)
     else:
         project_folder.mkdir(parents=True, exist_ok=True)
-        modified = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        write_prproj(project_folder / prproj_path.name, modified)
+        write_prproj(project_folder / prproj_path.name, serialize_prproj(root))
         log.info("  Proyecto empaquetado guardado.")
 
     return stats
