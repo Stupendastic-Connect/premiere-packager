@@ -147,18 +147,20 @@ def read_prproj(path: Path) -> bytes:
     return raw
 
 
-_XML_DECL = b'<?xml version="1.0" encoding="UTF-8"?>\n'
+_XML_DECL = b'<?xml version="1.0" encoding="UTF-8" ?>\n'
 
 
 def serialize_prproj(root: ET.Element) -> bytes:
-    """Serializa el árbol XML con la declaración que Premiere Pro espera.
+    """Serializa el árbol XML con el formato exacto que Premiere Pro espera.
 
-    ET.tostring genera comillas simples y 'utf-8' en minúsculas, lo cual
-    Premiere rechaza como proyecto corrupto.
+    Formato Adobe verificado contra .prproj originales:
+    - Declaración con espacio antes de ?>
+    - Etiquetas vacías auto-cerradas sin espacio: <Tag/>  (no <Tag />)
+    - Dos saltos de línea tras </PremiereData>
     """
-    body = ET.tostring(root, encoding="utf-8", xml_declaration=False,
-                       short_empty_elements=False)
-    return _XML_DECL + body
+    body = ET.tostring(root, encoding="utf-8", xml_declaration=False)
+    body = body.replace(b" />", b"/>")
+    return _XML_DECL + body + b"\n\n"
 
 
 def write_prproj(path: Path, xml_bytes: bytes) -> None:
