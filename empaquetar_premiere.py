@@ -30,9 +30,11 @@ import os
 import posixpath
 import re
 import shutil
+import struct
 import sys
 import unicodedata
 import xml.etree.ElementTree as ET
+import zlib
 from collections import deque
 from pathlib import Path, PurePosixPath
 
@@ -154,14 +156,38 @@ def serialize_prproj(root: ET.Element) -> bytes:
     ET.tostring genera comillas simples y 'utf-8' en minúsculas, lo cual
     Premiere rechaza como proyecto corrupto.
     """
-    body = ET.tostring(root, encoding="utf-8", xml_declaration=False)
+    body = ET.tostring(root, encoding="utf-8", xml_declaration=False,
+                       short_empty_elements=False)
     return _XML_DECL + body
 
 
 def write_prproj(path: Path, xml_bytes: bytes) -> None:
-    """Comprime XML con gzip y lo guarda como .prproj."""
-    with gzip.open(path, "wb") as f:
-        f.write(xml_bytes)
+    """Comprime XML con header gzip compatible con Premiere Pro.
+
+    Premiere valida el byte OS del header gzip y rechaza archivos que
+    no usen el valor 19 (custom de Adobe). Python's gzip usa 255 (Windows)
+    o 3 (Unix), lo cual causa "El proyecto parece dañado".
+    """
+    # Comprimir con deflate crudo (sin wrapper gzip)
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    compressed = compressor.compress(xml_bytes) + compressor.flush()
+
+    # Header gzip con OS byte = 19 (valor de Adobe)
+    header = struct.pack("<2sBBIBB",
+        b"\x1f\x8b",   # Magic number
+        8,              # Método: deflate
+        0,              # Flags: sin campos extra
+        0,              # MTime: cero
+        0,              # Extra flags
+        19,             # OS: Adobe Premiere (0x13)
+    )
+
+    # Trailer: CRC32 + tamaño original
+    crc = zlib.crc32(xml_bytes) & 0xFFFFFFFF
+    size = len(xml_bytes) & 0xFFFFFFFF
+    trailer = struct.pack("<II", crc, size)
+
+    path.write_bytes(header + compressed + trailer)
 
 
 # ---------------------------------------------------------------------------
