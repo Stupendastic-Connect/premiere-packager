@@ -905,7 +905,7 @@ def is_absolute_path(text: str) -> bool:
     return False
 
 
-_NUMBERED_PREFIX = re.compile(r"^\d+[\.\-\s]+\s*")
+_NUMBERED_PREFIX = re.compile(r"^\d{1,2}[\.\-\s]+\s*(?=\D)")
 
 
 def _clean_folder_name(name: str) -> str:
@@ -1073,16 +1073,55 @@ def _maybe_rewrite_alas_payload(
     fp = obj.get("fullpath")
     if not isinstance(fp, str):
         return payload
-    # Normalizar para matchear (rutas Mac pueden tener / u otras formas)
+    # Cascada de normalizacion para matchear variantes de ruta.
+    # AE almacena rutas Mac con /, Windows con \, y con distintas
+    # normalizaciones Unicode (NFC/NFD para acentos).
     new_fp = path_map.get(fp)
     if new_fp is None:
         new_fp = path_map.get(unicodedata.normalize("NFC", fp))
+    if new_fp is None:
+        new_fp = path_map.get(unicodedata.normalize("NFD", fp))
+    if new_fp is None:
+        new_fp = path_map.get(fp.replace("/", "\\"))
+    if new_fp is None:
+        new_fp = path_map.get(fp.replace("\\", "/"))
     if new_fp is None:
         return payload
     obj["fullpath"] = new_fp
     stats["rewritten"] = stats.get("rewritten", 0) + 1
     # ensure_ascii=False para preservar UTF-8 crudo (Adobe usa UTF-8 sin escapes)
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _validate_rifx(data: bytes) -> tuple[bool, str]:
+    """Validacion del envoltorio RIFX tras reescritura.
+
+    Los .aep reales contienen datos internos de AE que no son chunks RIFX
+    estandar (offsets, indices binarios). Solo verificamos el envoltorio
+    exterior: magic bytes, tamaño declarado coherente, y que el archivo
+    no se trunco ni se inflo. No validamos chunks internos porque el
+    rewriter copia verbatim todo lo que no es LIST/alas.
+
+    Retorna (True, "") si es valido o (False, motivo) si no.
+    """
+    if len(data) < 12:
+        return False, "archivo demasiado corto"
+    if data[:4] != b"RIFX":
+        return False, "magic bytes no son RIFX"
+
+    declared_body_size = struct.unpack(">I", data[4:8])[0]
+    if declared_body_size > len(data) - 8:
+        return False, (f"tamaño declarado ({declared_body_size}) excede "
+                       f"datos disponibles ({len(data) - 8})")
+
+    # Verificar que el tamaño no se desvio mas de un 10% del original
+    # (el rewrite solo cambia strings en alas, no deberia alterar mucho)
+    actual = len(data) - 8
+    if actual > 0 and abs(declared_body_size - actual) > actual * 0.1:
+        return False, (f"tamaño declarado ({declared_body_size}) difiere "
+                       f"significativamente del real ({actual})")
+
+    return True, ""
 
 
 def rewrite_aep_paths(
@@ -1124,6 +1163,15 @@ def rewrite_aep_paths(
 
     new_size = 4 + len(new_body)  # form + body
     new_data = b"RIFX" + struct.pack(">I", new_size) + form + new_body + trailing
+
+    # Validar estructura RIFX antes de escribir
+    valid, reason = _validate_rifx(new_data)
+    if not valid:
+        log.error("    [AE-REWRITE] Validacion RIFX fallo para %s: %s. "
+                  "Manteniendo original.", aep_path.name, reason)
+        stats["rewritten"] = 0
+        return stats
+
     try:
         aep_path.write_bytes(new_data)
     except OSError as exc:
@@ -1133,34 +1181,129 @@ def rewrite_aep_paths(
     return stats
 
 
-def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
-    """Escanea un proyecto After Effects (.aep/.aepx) buscando rutas de footage.
+def rewrite_aepx_paths(
+    aepx_path: Path,
+    path_map: dict[str, str],
+    log: logging.Logger,
+) -> dict[str, int]:
+    """Reescribe rutas de footage dentro de un .aepx (formato XML).
 
-    Para .aep (binario RIFX): decodifica como UTF-8 y busca patrones de rutas.
-    Para .aepx (XML): misma estrategia (las rutas estan en texto plano).
+    Los .aepx almacenan rutas en texto plano dentro de elementos XML.
+    Busca todas las rutas absolutas conocidas en path_map y las reemplaza.
+
+    Devuelve stats: {'rewritten': n}.
     """
+    stats = {"rewritten": 0}
     try:
-        data = aep_path.read_bytes()
+        raw = aepx_path.read_bytes()
     except OSError as exc:
-        log.warning("    [AE] Error leyendo %s: %s", aep_path.name, exc)
-        return set()
+        log.warning("    [AE-REWRITE] No se puede leer %s: %s", aepx_path.name, exc)
+        return stats
 
-    if len(data) > 200_000_000:
-        log.warning("    [AE] %s muy grande (%s), omitiendo escaneo",
-                     aep_path.name, _fmt_size(len(data)))
-        return set()
-
-    # Descomprimir si es gzip (.aepx puede estar comprimido)
-    if data[:2] == b"\x1f\x8b":
+    # Descomprimir si es gzip
+    was_gzip = raw[:2] == b"\x1f\x8b"
+    if was_gzip:
         try:
-            data = gzip.decompress(data)
+            raw = gzip.decompress(raw)
         except Exception:
-            pass
+            log.warning("    [AE-REWRITE] Error descomprimiendo %s", aepx_path.name)
+            return stats
+
+    text = raw.decode("utf-8", errors="replace")
+
+    # Reemplazar rutas conocidas en el texto XML.
+    # Ordenar por longitud descendente para evitar reemplazos parciales
+    # (ej: reemplazar /Volumes/A antes de /Volumes/AB).
+    sorted_paths = sorted(path_map.keys(), key=len, reverse=True)
+    for old_path in sorted_paths:
+        new_path = path_map[old_path]
+        if old_path in text:
+            count = text.count(old_path)
+            text = text.replace(old_path, new_path)
+            stats["rewritten"] += count
+
+    if stats["rewritten"] == 0:
+        return stats
+
+    out_bytes = text.encode("utf-8")
+    if was_gzip:
+        import io
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            gz.write(out_bytes)
+        out_bytes = buf.getvalue()
+
+    try:
+        aepx_path.write_bytes(out_bytes)
+    except OSError as exc:
+        log.error("    [AE-REWRITE] Error escribiendo %s: %s", aepx_path.name, exc)
+        return stats
+
+    return stats
+
+
+def _scan_aep_alas_paths(data: bytes) -> set[str]:
+    """Extrae todas las rutas 'fullpath' de chunks 'alas' en datos RIFX.
+
+    Parsea la estructura de chunks del formato .aep (RIFX big-endian) y
+    extrae el campo 'fullpath' del JSON almacenado en cada chunk 'alas'.
+    Esto es mucho mas preciso que buscar rutas con regex sobre bytes crudos,
+    ya que solo devuelve rutas de footage real (no render outputs, expresiones,
+    u otros strings que parezcan rutas).
+
+    Retorna set vacio si los datos no son RIFX valido.
+    """
+    if len(data) < 12 or data[:4] != b"RIFX":
+        return set()
 
     paths: set[str] = set()
-    exclude = str(aep_path)
+    declared_body_size = struct.unpack(">I", data[4:8])[0]
+    body_end = min(8 + declared_body_size, len(data))
 
-    # Decodificar como UTF-8; los bytes binarios se convierten en \ufffd
+    # Iteracion con pila (evita recursion profunda en proyectos grandes)
+    # Cada entrada: (start, end) del rango de chunks a procesar
+    stack: list[tuple[int, int]] = [(12, body_end)]
+
+    while stack:
+        region_start, region_end = stack.pop()
+        pos = region_start
+        while pos + 8 <= region_end:
+            cid = data[pos:pos+4]
+            clen = struct.unpack(">I", data[pos+4:pos+8])[0]
+            payload_start = pos + 8
+            payload_end = payload_start + clen
+            if payload_end > region_end:
+                break  # chunk corrupto, salir de esta region
+
+            if cid == b"LIST":
+                # Apilar el contenido del LIST (saltar los 4 bytes del form type)
+                if payload_start + 4 <= payload_end:
+                    stack.append((payload_start + 4, payload_end))
+            elif cid == b"alas":
+                # Intentar parsear JSON y extraer fullpath
+                try:
+                    obj = json.loads(data[payload_start:payload_end].decode("utf-8"))
+                    if isinstance(obj, dict):
+                        fp = obj.get("fullpath")
+                        if isinstance(fp, str) and fp and is_absolute_path(fp):
+                            paths.add(fp)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+
+            pos = payload_end
+            if clen % 2:
+                pos += 1  # padding byte
+
+    return paths
+
+
+def _scan_aep_regex_paths(data: bytes, exclude: str = "") -> set[str]:
+    """Busca rutas de footage con regex sobre bytes decodificados.
+
+    Fallback para .aepx (XML) y .aep antiguos sin chunks 'alas' JSON.
+    Puede producir falsos positivos (render outputs, expresiones, etc.).
+    """
+    paths: set[str] = set()
     text = data.decode("utf-8", errors="replace")
 
     for m in _RE_AE_WIN_PATH.finditer(text):
@@ -1186,6 +1329,45 @@ def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
     return paths
 
 
+def _scan_aep_for_footage(aep_path: Path, log: logging.Logger) -> set[str]:
+    """Escanea un proyecto After Effects (.aep/.aepx) buscando rutas de footage.
+
+    Para .aep (binario RIFX): usa parseo estructural de chunks 'alas' (preciso),
+    con fallback a regex si no se encuentran chunks alas.
+    Para .aepx (XML): usa regex sobre el texto (los paths estan en texto plano).
+    """
+    try:
+        data = aep_path.read_bytes()
+    except OSError as exc:
+        log.warning("    [AE] Error leyendo %s: %s", aep_path.name, exc)
+        return set()
+
+    if len(data) > 200_000_000:
+        log.warning("    [AE] %s muy grande (%s), omitiendo escaneo",
+                     aep_path.name, _fmt_size(len(data)))
+        return set()
+
+    # Descomprimir si es gzip (.aepx puede estar comprimido)
+    if data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except Exception:
+            pass
+
+    exclude = str(aep_path)
+
+    # Para .aep RIFX: usar scanner estructural (preciso, sin falsos positivos)
+    if data[:4] == b"RIFX":
+        paths = _scan_aep_alas_paths(data)
+        if paths:
+            return paths
+        # Fallback: si no hay chunks alas (AE version antigua), usar regex
+        return _scan_aep_regex_paths(data, exclude)
+
+    # Para .aepx (XML) y otros formatos: regex
+    return _scan_aep_regex_paths(data, exclude)
+
+
 class FileIndex:
     """Indice de archivos bajo un directorio, construido con un solo os.walk.
 
@@ -1202,7 +1384,6 @@ class FileIndex:
     ) -> None:
         self._root = project_root
         self._by_name: dict[str, list[Path]] = {}
-        self.ae_projects: set[str] = set()
 
         skip = skip_dirs
         if exclude_folder:
@@ -1211,7 +1392,7 @@ class FileIndex:
         self._skip = skip
         self._walk_root(project_root)
 
-    def _walk_root(self, root: Path, collect_ae: bool = True) -> None:
+    def _walk_root(self, root: Path) -> None:
         """Indexa todos los archivos bajo *root*."""
         try:
             for dirpath, dirnames, filenames in os.walk(root):
@@ -1220,8 +1401,6 @@ class FileIndex:
                     full = Path(dirpath) / fname
                     key = unicodedata.normalize("NFC", fname).lower()
                     self._by_name.setdefault(key, []).append(full)
-                    if collect_ae and Path(fname).suffix.lower() in AE_PROJECT_EXTENSIONS:
-                        self.ae_projects.add(str(full))
         except OSError:
             pass
 
@@ -1288,7 +1467,7 @@ class FileIndex:
             except ValueError:
                 pass
             before = sum(len(v) for v in self._by_name.values())
-            self._walk_root(root, collect_ae=False)
+            self._walk_root(root)
             after = sum(len(v) for v in self._by_name.values())
             added = after - before
             if added:
@@ -1333,7 +1512,19 @@ class FileIndex:
         if best_score > second_score:
             return best
 
-        # Empate -> ambiguo, no resolver
+        # Empate -> tiebreaker: preferir candidatos dentro del project_root
+        tied = [c for s, c in scored if s == best_score]
+        in_project = []
+        for c in tied:
+            try:
+                c.relative_to(self._root)
+                in_project.append(c)
+            except ValueError:
+                pass
+        if len(in_project) == 1:
+            return in_project[0]
+
+        # Aun hay empate -> ambiguo, no resolver
         log.warning(
             "    [AMBIGUO]  %s: %d coincidencias con mismo score, no resuelto",
             src.name, sum(1 for s, _ in scored if s == best_score),
@@ -1343,6 +1534,26 @@ class FileIndex:
             [str(c) for _, c in scored],
         )
         return None
+
+
+def _compute_dest_path(
+    src_path: Path,
+    project_root: Path,
+    project_folder: Path,
+    media_folder: Path,
+) -> Path:
+    """Calcula la ruta destino de un medio dentro del paquete.
+
+    Internos (dentro de project_root): mantienen estructura relativa limpia.
+    Externos: van a Otros/ con estructura por drive.
+    """
+    try:
+        rel = src_path.relative_to(project_root)
+        clean_parts = [_clean_folder_name(p) for p in rel.parent.parts]
+        clean_rel = Path(*clean_parts, rel.name) if clean_parts else rel
+        return project_folder / clean_rel
+    except ValueError:
+        return media_dest_path(str(src_path), media_folder)
 
 
 def _expand_ae_dependencies(
@@ -1415,6 +1626,48 @@ _AE_SKIP_DIRS = frozenset({
     "almacenamiento automático de adobe after effects",
     "adobe after effects auto-save",
 })
+
+
+def _infer_volume_mappings(
+    resolved_pairs: dict[str, Path],
+    log: logging.Logger,
+) -> dict[str, str]:
+    """Infiere mappings Mac-volume->Windows-prefix a partir de archivos resueltos.
+
+    Cuando el FileIndex resuelve un archivo de /Volumes/X/a/b/c.mp4 a
+    W:\\prefix\\a\\b\\c.mp4, se deduce que /Volumes/X -> W:\\prefix.
+    Si 2+ archivos de un mismo volumen coinciden en el mismo prefijo
+    Windows, el mapping se considera fiable.
+    """
+    from collections import Counter
+    votes: dict[str, Counter[str]] = {}
+
+    for orig, resolved in resolved_pairs.items():
+        norm_orig = orig.replace("\\", "/")
+        if not norm_orig.startswith("/Volumes/"):
+            continue
+        parts = norm_orig.split("/")
+        if len(parts) < 4:
+            continue
+        mac_vol = "/".join(parts[:3])
+        mac_suffix = "/".join(parts[3:])
+
+        win_str = str(resolved).replace("\\", "/")
+        # Comparar sufijos case-insensitive para manejar diferencias Win/Mac
+        if win_str.lower().endswith(mac_suffix.lower()):
+            win_prefix = win_str[: len(win_str) - len(mac_suffix)].rstrip("/")
+            votes.setdefault(mac_vol, Counter())[win_prefix] += 1
+
+    result: dict[str, str] = {}
+    for mac_vol, counts in votes.items():
+        best_prefix, best_count = counts.most_common(1)[0]
+        if best_count >= 2:
+            result[mac_vol] = best_prefix
+            log.info(
+                "  Mapping inferido: %s -> %s (%d archivos)",
+                mac_vol, best_prefix, best_count,
+            )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1638,16 +1891,12 @@ def package_project(
         src_path = Path(translated)
         src_map[orig] = src_path
 
+        dest = _compute_dest_path(src_path, project_root, project_folder, media_folder)
+        path_map[orig] = dest
         try:
-            rel = src_path.relative_to(project_root)
-            # Limpiar prefijos numerados: "1. Material/..." -> "Material/..."
-            clean_parts = [_clean_folder_name(p) for p in rel.parent.parts]
-            clean_rel = Path(*clean_parts, rel.name) if clean_parts else rel
-            path_map[orig] = project_folder / clean_rel
+            src_path.relative_to(project_root)
             internal_count += 1
         except ValueError:
-            # Archivo externo al proyecto -> Otros/ con estructura por drive
-            path_map[orig] = media_dest_path(translated, media_folder)
             external_count += 1
 
     if external_count:
@@ -1676,14 +1925,8 @@ def package_project(
         log.info("    [RESUELTO] %s -> %s", src.name, resolved)
         src_map[orig] = resolved
         resolved_count += 1
-        # Recalcular destino segun nueva ubicacion
-        try:
-            rel = resolved.relative_to(project_root)
-            clean_parts = [_clean_folder_name(p) for p in rel.parent.parts]
-            clean_rel = Path(*clean_parts, rel.name) if clean_parts else rel
-            path_map[orig] = project_folder / clean_rel
-        except ValueError:
-            path_map[orig] = media_dest_path(str(resolved), media_folder)
+        path_map[orig] = _compute_dest_path(
+            resolved, project_root, project_folder, media_folder)
 
     if resolved_count or ambiguous_count:
         parts = []
@@ -1692,6 +1935,89 @@ def package_project(
         if ambiguous_count:
             parts.append(f"ambiguos: {ambiguous_count}")
         log.info("  Archivos offline %s", " | ".join(parts))
+
+    # --- Pass 2: inferir mappings de volúmenes Mac y aplicar ---
+    # A partir de los archivos ya resueltos, deducimos que
+    # /Volumes/X -> W:\prefix y lo aplicamos a los que quedaron offline.
+    resolved_pairs = {
+        orig: src_map[orig]
+        for orig in target_paths
+        if orig.startswith("/Volumes/") and src_map[orig].exists()
+    }
+    inferred = _infer_volume_mappings(resolved_pairs, log)
+
+    if inferred:
+        inferred_count = 0
+        for orig in sorted(target_paths):
+            src = src_map[orig]
+            if src.exists():
+                continue
+            norm = orig.replace("\\", "/")
+            if not norm.startswith("/Volumes/"):
+                continue
+            parts = norm.split("/")
+            if len(parts) < 4:
+                continue
+            mac_vol = "/".join(parts[:3])
+            win_prefix = inferred.get(mac_vol)
+            if win_prefix is None:
+                continue
+            mac_suffix = "/".join(parts[3:])
+            candidate = Path(win_prefix) / mac_suffix
+            if candidate.exists():
+                log.info("    [INFERIDO] %s -> %s", src.name, candidate)
+                src_map[orig] = candidate
+                inferred_count += 1
+                path_map[orig] = _compute_dest_path(
+                    candidate, project_root, project_folder, media_folder)
+            else:
+                # El mapping es correcto pero el archivo no existe en disco.
+                # Intentar resolver por nombre con el path traducido (mejor
+                # contexto para desambiguacion que el path Mac original).
+                resolved = file_index.resolve(candidate, log)
+                if resolved is not None:
+                    log.info("    [INFERIDO+IDX] %s -> %s", src.name, resolved)
+                    src_map[orig] = resolved
+                    inferred_count += 1
+                    path_map[orig] = _compute_dest_path(
+                        resolved, project_root, project_folder, media_folder)
+
+        if inferred_count:
+            log.info("  Resueltos con mapping inferido: %d", inferred_count)
+
+    # --- Segunda pasada AE con mappings inferidos ---
+    # Las dependencias AE descubiertas en la primera pasada usaron solo
+    # los --map del usuario. Ahora que tenemos mappings inferidos de
+    # volumenes Mac, repetimos la expansion para encontrar footage AE
+    # que antes no se podia resolver.
+    if inferred:
+        combined_mappings = list(path_mappings)
+        for mac_vol, win_prefix in inferred.items():
+            combined_mappings.append((mac_vol, win_prefix.replace("/", "\\")))
+        # Ordenar por longitud descendente (match mas especifico primero)
+        combined_mappings.sort(key=lambda x: len(x[0]), reverse=True)
+
+        ae_extra2 = _expand_ae_dependencies(
+            target_paths, combined_mappings, log, file_index)
+        if ae_extra2:
+            new_ae = ae_extra2 - target_paths
+            for dep in new_ae:
+                target_paths.add(dep)
+                normalized = normalize_media_path(dep)
+                translated = translate_path(normalized, combined_mappings)
+                src_path = Path(translated)
+                src_map[dep] = src_path
+                path_map[dep] = _compute_dest_path(
+                    src_path, project_root, project_folder, media_folder)
+                # Intentar resolver offline
+                if not src_path.exists():
+                    resolved = file_index.resolve(src_path, log)
+                    if resolved is not None:
+                        src_map[dep] = resolved
+                        path_map[dep] = _compute_dest_path(
+                            resolved, project_root, project_folder, media_folder)
+            if new_ae:
+                log.info("  Dependencias AE (2da pasada): +%d archivos", len(new_ae))
 
     copied_origs: set[str] = set()  # Medios que se copiaron/copiarian
     for orig in sorted(target_paths):
@@ -1733,32 +2059,79 @@ def package_project(
         aep_path_map: dict[str, str] = {}
         for orig in copied_origs:
             dst = path_map[orig]
-            # AE almacena rutas Mac-style con forward slashes. Mantener ese
-            # formato para maximizar la probabilidad de match si el .aep
-            # venia de macOS. En Windows AE acepta ambas formas.
-            aep_path_map[orig] = str(dst).replace("\\", "/")
-            # Tambien registrar variantes que AE podria almacenar:
-            # - la ruta normalizada NFC
-            nfc = unicodedata.normalize("NFC", orig)
-            if nfc != orig:
-                aep_path_map[nfc] = aep_path_map[orig]
+            dst_str = str(dst).replace("\\", "/")
+
+            # Registrar multiples variantes de la ruta que AE podria almacenar
+            # en sus chunks 'alas'. AE puede guardar la ruta con forward slashes
+            # (Mac), backslashes (Windows), en NFC o NFD, o con la forma
+            # traducida tras --map.
+            variants: set[str] = set()
+            variants.add(orig)
+            variants.add(unicodedata.normalize("NFC", orig))
+            variants.add(unicodedata.normalize("NFD", orig))
+            variants.add(orig.replace("\\", "/"))
+            variants.add(orig.replace("/", "\\"))
+            # Variante traducida (resultado de --map)
+            translated = str(src_map[orig])
+            if translated != orig:
+                variants.add(translated)
+                variants.add(translated.replace("\\", "/"))
+                variants.add(translated.replace("/", "\\"))
+                variants.add(unicodedata.normalize("NFC", translated))
+
+            for v in variants:
+                aep_path_map[v] = dst_str
 
         aep_files_copied = [
             path_map[o] for o in copied_origs
             if Path(o).suffix.lower() in AE_PROJECT_EXTENSIONS
                and path_map[o].exists()
-               and path_map[o].suffix.lower() == ".aep"
         ]
         if aep_files_copied:
+            # Enriquecer el mapa con las rutas tal como AE las almacena
+            # internamente en los chunks 'alas'. Estas pueden diferir de
+            # lo que Premiere almacena en su XML.
+            for aep_dst in aep_files_copied:
+                if aep_dst.suffix.lower() != ".aep":
+                    continue
+                try:
+                    aep_data = aep_dst.read_bytes()
+                except OSError:
+                    continue
+                internal_paths = _scan_aep_alas_paths(aep_data)
+                for ip in internal_paths:
+                    if ip in aep_path_map:
+                        continue  # ya mapeada
+                    # Buscar si alguna variante ya tiene destino
+                    ip_nfc = unicodedata.normalize("NFC", ip)
+                    ip_fwd = ip.replace("\\", "/")
+                    ip_bck = ip.replace("/", "\\")
+                    dst_str = (aep_path_map.get(ip_nfc)
+                               or aep_path_map.get(ip_fwd)
+                               or aep_path_map.get(ip_bck)
+                               or aep_path_map.get(unicodedata.normalize("NFD", ip)))
+                    if dst_str:
+                        aep_path_map[ip] = dst_str
+                    else:
+                        # Intentar resolver por nombre de archivo
+                        ip_name = Path(ip).name.lower()
+                        for orig2 in copied_origs:
+                            if Path(orig2).name.lower() == ip_name:
+                                aep_path_map[ip] = str(path_map[orig2]).replace("\\", "/")
+                                break
+
             total_rewritten = 0
             for aep_dst in aep_files_copied:
-                rs = rewrite_aep_paths(aep_dst, aep_path_map, log)
+                if aep_dst.suffix.lower() == ".aep":
+                    rs = rewrite_aep_paths(aep_dst, aep_path_map, log)
+                else:
+                    rs = rewrite_aepx_paths(aep_dst, aep_path_map, log)
                 total_rewritten += rs.get("rewritten", 0)
             if total_rewritten:
-                log.info("  Rutas reescritas en %d .aep: %d footage links actualizados",
+                log.info("  Rutas reescritas en %d proyecto(s) AE: %d footage links actualizados",
                          len(aep_files_copied), total_rewritten)
             else:
-                log.info("  .aep procesados: %d (sin cambios, formato no reconocido o rutas ya correctas)",
+                log.info("  Proyectos AE procesados: %d (sin cambios o rutas ya correctas)",
                          len(aep_files_copied))
 
     # --- Mostrar estructura de carpetas del empaquetado ---
@@ -1902,6 +2275,28 @@ def package_project(
                 elem.text = "./" + str(rel).replace("\\", "/")
             except ValueError:
                 elem.text = str(dst).replace("\\", "/")
+
+    # --- Eliminar OfflineReason para medios relinkados ---
+    # Premiere marca clips con <OfflineReason>N</OfflineReason> cuando no
+    # puede encontrar el archivo.  Si ya hemos reescrito la ruta a una
+    # ubicacion relativa valida (./...), debemos quitar OfflineReason para
+    # que Premiere intente abrir el archivo en vez de darlo por perdido.
+    removed_offline = 0
+    for parent in root.iter():
+        offline_el = None
+        has_relinked = False
+        for child in parent:
+            if child.tag == "OfflineReason":
+                offline_el = child
+            elif child.tag in ("ActualMediaFilePath", "FilePath") and child.text:
+                if child.text.strip().startswith("./"):
+                    has_relinked = True
+        if offline_el is not None and has_relinked:
+            parent.remove(offline_el)
+            removed_offline += 1
+
+    if removed_offline:
+        log.info("  OfflineReason eliminados: %d", removed_offline)
 
     # --- Guardar ---
     if dry_run:

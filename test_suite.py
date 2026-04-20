@@ -12,9 +12,11 @@ Cubre:
 """
 
 import gzip
+import json
 import logging
 import os
 import shutil
+import struct
 import tempfile
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -26,10 +28,16 @@ from empaquetar_premiere import (
     PrprojGraph,
     _AE_SKIP_DIRS,
     _clean_folder_name,
+    _compute_dest_path,
     _expand_ae_dependencies,
     _fmt_size,
+    _infer_volume_mappings,
     _is_plausible_path,
+    _maybe_rewrite_alas_payload,
+    _scan_aep_alas_paths,
     _scan_aep_for_footage,
+    _scan_aep_regex_paths,
+    _validate_rifx,
     is_absolute_path,
     is_auto_nested_name,
     list_sequences,
@@ -38,6 +46,8 @@ from empaquetar_premiere import (
     package_project,
     parse_path_mappings,
     read_prproj,
+    rewrite_aep_paths,
+    rewrite_aepx_paths,
     score_sequence,
     select_sequence_auto,
     select_sequence_by_pattern,
@@ -426,6 +436,39 @@ def test_clean_folder_name():
     check("prefijo con espacio", _clean_folder_name("3 Renders"), "Renders")
     check("sin prefijo", _clean_folder_name("Media"), "Media")
     check("doble digito", _clean_folder_name("10. Exports"), "Exports")
+    # Carpetas de fecha NO deben limpiarse
+    check("fecha yy-mm-dd", _clean_folder_name("25-07-05"), "25-07-05")
+    check("fecha yy-mm-dd 2", _clean_folder_name("24-03-22"), "24-03-22")
+    check("fecha corta", _clean_folder_name("07-05"), "07-05")
+
+
+def test_infer_volume_mappings():
+    print("\n=== Test: _infer_volume_mappings ===")
+    log = logging.getLogger("test_infer")
+    log.setLevel(logging.WARNING)
+
+    # Caso 1: mapping consistente con 3 archivos
+    pairs = {
+        "/Volumes/DISCO/Proyecto/1. Material/a.mp4": Path("U:/Cliente/Proyecto/1. Material/a.mp4"),
+        "/Volumes/DISCO/Proyecto/1. Material/b.mp4": Path("U:/Cliente/Proyecto/1. Material/b.mp4"),
+        "/Volumes/DISCO/Otro/c.mp4": Path("U:/Cliente/Otro/c.mp4"),
+    }
+    result = _infer_volume_mappings(pairs, log)
+    check("infiere volumen", result.get("/Volumes/DISCO"), "U:/Cliente")
+
+    # Caso 2: menos de 2 archivos -> no infiere
+    pairs2 = {
+        "/Volumes/RARO/x/file.mp4": Path("Z:/x/file.mp4"),
+    }
+    result2 = _infer_volume_mappings(pairs2, log)
+    check("no infiere con 1 archivo", "/Volumes/RARO" in result2, False)
+
+    # Caso 3: paths Windows no aplican
+    pairs3 = {
+        "C:/Users/foo/a.mp4": Path("D:/backup/a.mp4"),
+    }
+    result3 = _infer_volume_mappings(pairs3, log)
+    check("ignora paths no-Mac", len(result3), 0)
 
 
 def test_unique_folder_name():
@@ -1009,6 +1052,299 @@ def test_expand_ae_dependencies():
         # El footage.mov deberia ser encontrado como dependencia
         check_true("encuentra dependencia de AE",
                     any("footage.mov" in d for d in deps))
+
+
+# =====================================================================
+# 5b. SCANNER ESTRUCTURAL alas, VALIDACION RIFX, REWRITE .aepx
+# =====================================================================
+
+def _build_rifx_with_alas(paths: list[str]) -> bytes:
+    """Construye un archivo RIFX minimo con chunks 'alas' JSON para tests."""
+    body = bytearray()
+    for p in paths:
+        payload = json.dumps({"fullpath": p}, separators=(",", ":"),
+                              ensure_ascii=False).encode("utf-8")
+        body += b"alas" + struct.pack(">I", len(payload)) + payload
+        if len(payload) % 2:
+            body += b"\x00"  # padding
+    form = b"FaFx"  # form type (AE usa "FaFx")
+    total_size = 4 + len(body)
+    return b"RIFX" + struct.pack(">I", total_size) + form + bytes(body)
+
+
+def test_scan_aep_alas_paths():
+    """_scan_aep_alas_paths extrae fullpath de chunks alas RIFX."""
+    print("\n=== Test: _scan_aep_alas_paths ===")
+    data = _build_rifx_with_alas([
+        "D:/Media/scene01.mov",
+        "/Volumes/SSD/audio.wav",
+        "C:/Project/comp.aep",
+    ])
+    paths = _scan_aep_alas_paths(data)
+    check_true("encuentra scene01.mov", "D:/Media/scene01.mov" in paths)
+    check_true("encuentra audio.wav", "/Volumes/SSD/audio.wav" in paths)
+    check_true("encuentra comp.aep", "C:/Project/comp.aep" in paths)
+    check("3 rutas encontradas", len(paths), 3)
+
+
+def test_scan_aep_alas_paths_empty():
+    """RIFX sin chunks alas devuelve set vacio."""
+    print("\n=== Test: _scan_aep_alas_paths vacio ===")
+    # RIFX minimo sin alas
+    form = b"FaFx"
+    body = b"opaq" + struct.pack(">I", 4) + b"test"
+    data = b"RIFX" + struct.pack(">I", 4 + len(body)) + form + body
+    paths = _scan_aep_alas_paths(data)
+    check("sin rutas", len(paths), 0)
+
+
+def test_scan_aep_alas_paths_not_rifx():
+    """Datos no-RIFX devuelven set vacio."""
+    print("\n=== Test: _scan_aep_alas_paths no RIFX ===")
+    paths = _scan_aep_alas_paths(b"NOT RIFX DATA")
+    check("no RIFX", len(paths), 0)
+
+
+def test_scan_aep_alas_paths_nested_list():
+    """Chunks alas dentro de LIST anidado se encuentran."""
+    print("\n=== Test: _scan_aep_alas_paths nested LIST ===")
+    payload = json.dumps({"fullpath": "D:/deep/file.mov"},
+                          separators=(",", ":")).encode("utf-8")
+    alas_chunk = b"alas" + struct.pack(">I", len(payload)) + payload
+    # LIST wrapping
+    list_form = b"Item"
+    list_body = list_form + alas_chunk
+    list_chunk = b"LIST" + struct.pack(">I", len(list_body)) + list_body
+    form = b"FaFx"
+    total_size = 4 + len(list_chunk)
+    data = b"RIFX" + struct.pack(">I", total_size) + form + list_chunk
+    paths = _scan_aep_alas_paths(data)
+    check_true("encuentra ruta en LIST anidado", "D:/deep/file.mov" in paths)
+
+
+def test_scan_aep_alas_invalid_json():
+    """Chunk alas con datos no-JSON no rompe el scanner."""
+    print("\n=== Test: _scan_aep_alas_paths JSON invalido ===")
+    bad_payload = b"not json at all"
+    body = bytearray()
+    body += b"alas" + struct.pack(">I", len(bad_payload)) + bad_payload
+    if len(bad_payload) % 2:
+        body += b"\x00"
+    # Un alas valido despues
+    good = json.dumps({"fullpath": "D:/ok.mp4"},
+                       separators=(",", ":")).encode("utf-8")
+    body += b"alas" + struct.pack(">I", len(good)) + good
+    if len(good) % 2:
+        body += b"\x00"
+    form = b"FaFx"
+    data = b"RIFX" + struct.pack(">I", 4 + len(body)) + form + bytes(body)
+    paths = _scan_aep_alas_paths(data)
+    check_true("ignora JSON invalido, encuentra valido", "D:/ok.mp4" in paths)
+    check("solo 1 ruta", len(paths), 1)
+
+
+def test_scan_aep_for_footage_uses_structural():
+    """_scan_aep_for_footage usa scanner estructural para RIFX."""
+    print("\n=== Test: _scan_aep_for_footage usa structural ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        aep = Path(tmp) / "test.aep"
+        # Crear RIFX con una ruta en alas + una ruta "basura" que solo regex
+        # encontraria (render output, no footage real)
+        data = _build_rifx_with_alas(["D:/Footage/real_clip.mov"])
+        # Agregar bytes extra que parecen una ruta pero no estan en alas
+        # (simula render output path en zona binaria)
+        fake_path = b"D:/Renders/output_final.mp4"
+        aep.write_bytes(data + fake_path)
+        paths = _scan_aep_for_footage(aep, log)
+        check_true("encuentra footage real de alas",
+                    any("real_clip.mov" in p for p in paths))
+        # El scanner estructural NO debe encontrar la ruta falsa
+        check_true("no incluye render output (falso positivo)",
+                    not any("output_final.mp4" in p for p in paths))
+
+
+def test_validate_rifx_valid():
+    """_validate_rifx acepta RIFX bien formado."""
+    print("\n=== Test: _validate_rifx valido ===")
+    data = _build_rifx_with_alas(["D:/test.mov"])
+    valid, reason = _validate_rifx(data)
+    check_true("RIFX valido", valid)
+    check("sin motivo", reason, "")
+
+
+def test_validate_rifx_bad_magic():
+    """_validate_rifx rechaza magic incorrecto."""
+    print("\n=== Test: _validate_rifx bad magic ===")
+    valid, reason = _validate_rifx(b"RIFF" + b"\x00" * 8)
+    check_true("rechaza magic incorrecto", not valid)
+    check_true("motivo dice magic", "magic" in reason.lower() or "RIFX" in reason)
+
+
+def test_validate_rifx_truncated():
+    """_validate_rifx rechaza archivo truncado."""
+    print("\n=== Test: _validate_rifx truncado ===")
+    # Declarar tamaño mayor que datos reales
+    data = b"RIFX" + struct.pack(">I", 1000) + b"FaFx"
+    valid, reason = _validate_rifx(data)
+    check_true("rechaza truncado", not valid)
+
+
+def test_validate_rifx_size_mismatch():
+    """_validate_rifx rechaza si tamaño declarado difiere >10% del real."""
+    print("\n=== Test: _validate_rifx size mismatch ===")
+    # Crear datos donde declared_body < actual_body por >10%
+    form = b"FaFx"
+    padding = b"\x00" * 988  # total body = 4 + 988 = 992
+    actual_body = 4 + len(padding)  # 992
+    declared_body = actual_body // 2  # 496 (~50% off)
+    data = b"RIFX" + struct.pack(">I", declared_body) + form + padding
+    valid, reason = _validate_rifx(data)
+    check_true("rechaza size mismatch grande", not valid)
+
+
+def test_rewrite_aep_paths_with_validation():
+    """rewrite_aep_paths valida RIFX antes de escribir."""
+    print("\n=== Test: rewrite_aep_paths con validacion ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        aep = Path(tmp) / "test.aep"
+        data = _build_rifx_with_alas(["D:/old/clip.mov"])
+        aep.write_bytes(data)
+        path_map = {"D:/old/clip.mov": "D:/new/clip.mov"}
+        stats = rewrite_aep_paths(aep, path_map, log)
+        check_true("reescribe al menos 1", stats["rewritten"] >= 1)
+        # Verificar que el archivo reescrito contiene la nueva ruta
+        new_data = aep.read_bytes()
+        check_true("contiene nueva ruta",
+                    b"D:/new/clip.mov" in new_data)
+        check_true("no contiene ruta vieja",
+                    b"D:/old/clip.mov" not in new_data)
+        # Verificar RIFX valido
+        valid, _ = _validate_rifx(new_data)
+        check_true("RIFX sigue valido tras rewrite", valid)
+
+
+def test_rewrite_aepx_paths():
+    """rewrite_aepx_paths reescribe rutas en XML."""
+    print("\n=== Test: rewrite_aepx_paths ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        aepx = Path(tmp) / "comp.aepx"
+        content = """<?xml version="1.0"?>
+<AfterEffectsProject>
+    <Footage>
+        <item path="D:/Old/Media/scene.mov" />
+        <item path="/Volumes/SSD/audio.wav" />
+    </Footage>
+</AfterEffectsProject>"""
+        aepx.write_text(content, encoding="utf-8")
+        path_map = {
+            "D:/Old/Media/scene.mov": "D:/New/Pack/scene.mov",
+            "/Volumes/SSD/audio.wav": "D:/New/Pack/audio.wav",
+        }
+        stats = rewrite_aepx_paths(aepx, path_map, log)
+        check_true("reescribe rutas", stats["rewritten"] >= 2)
+        text = aepx.read_text(encoding="utf-8")
+        check_true("contiene nueva ruta scene",
+                    "D:/New/Pack/scene.mov" in text)
+        check_true("contiene nueva ruta audio",
+                    "D:/New/Pack/audio.wav" in text)
+        check_true("no contiene ruta vieja scene",
+                    "D:/Old/Media/scene.mov" not in text)
+
+
+def test_rewrite_aepx_paths_gzipped():
+    """rewrite_aepx_paths maneja .aepx comprimido con gzip."""
+    print("\n=== Test: rewrite_aepx_paths gzipped ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        aepx = Path(tmp) / "comp.aepx"
+        content = b'<AE><path>D:/Old/clip.mov</path></AE>'
+        with gzip.open(aepx, "wb") as f:
+            f.write(content)
+        path_map = {"D:/Old/clip.mov": "D:/New/clip.mov"}
+        stats = rewrite_aepx_paths(aepx, path_map, log)
+        check_true("reescribe en gzip", stats["rewritten"] >= 1)
+        # Verificar que sigue siendo gzip
+        raw = aepx.read_bytes()
+        check_true("sigue siendo gzip", raw[:2] == b"\x1f\x8b")
+        text = gzip.decompress(raw).decode("utf-8")
+        check_true("contiene nueva ruta", "D:/New/clip.mov" in text)
+
+
+def test_rewrite_aepx_no_match():
+    """rewrite_aepx_paths no modifica si no hay match."""
+    print("\n=== Test: rewrite_aepx_paths sin match ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        aepx = Path(tmp) / "comp.aepx"
+        content = '<AE><path>D:/Other/file.mov</path></AE>'
+        aepx.write_text(content, encoding="utf-8")
+        path_map = {"D:/NoMatch/x.mov": "D:/New/x.mov"}
+        stats = rewrite_aepx_paths(aepx, path_map, log)
+        check("sin reescrituras", stats["rewritten"], 0)
+        # Archivo no debe haber cambiado
+        check("contenido intacto", aepx.read_text(encoding="utf-8"), content)
+
+
+def test_maybe_rewrite_alas_payload_variants():
+    """_maybe_rewrite_alas_payload matchea variantes de ruta."""
+    print("\n=== Test: _maybe_rewrite_alas_payload variantes ===")
+
+    dst = "D:/Pack/clip.mov"
+
+    # Variante con forward slashes
+    path_map = {"D:\\Media\\clip.mov": dst}
+    payload = json.dumps({"fullpath": "D:/Media/clip.mov"},
+                          separators=(",", ":")).encode("utf-8")
+    stats: dict[str, int] = {}
+    result = _maybe_rewrite_alas_payload(payload, path_map, stats)
+    obj = json.loads(result)
+    check("match forward->backslash", obj["fullpath"], dst)
+
+    # Variante con backslashes
+    path_map2 = {"D:/Media/clip.mov": dst}
+    payload2 = json.dumps({"fullpath": "D:\\Media\\clip.mov"},
+                           separators=(",", ":")).encode("utf-8")
+    stats2: dict[str, int] = {}
+    result2 = _maybe_rewrite_alas_payload(payload2, path_map2, stats2)
+    obj2 = json.loads(result2)
+    check("match backslash->forward", obj2["fullpath"], dst)
+
+    # Variante NFC vs NFD (letra con acento)
+    import unicodedata
+    nfc_path = unicodedata.normalize("NFC", "/Volumes/Edición/clip.mov")
+    nfd_path = unicodedata.normalize("NFD", "/Volumes/Edición/clip.mov")
+    path_map3 = {nfc_path: dst}
+    payload3 = json.dumps({"fullpath": nfd_path},
+                           separators=(",", ":")).encode("utf-8")
+    stats3: dict[str, int] = {}
+    result3 = _maybe_rewrite_alas_payload(payload3, path_map3, stats3)
+    obj3 = json.loads(result3)
+    check("match NFD->NFC", obj3["fullpath"], dst)
+
+
+def test_compute_dest_path():
+    """_compute_dest_path calcula rutas internas vs externas."""
+    print("\n=== Test: _compute_dest_path ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        project_root = Path(tmp) / "project"
+        project_folder = Path(tmp) / "output"
+        media_folder = project_folder / "Otros"
+        project_root.mkdir()
+        project_folder.mkdir()
+
+        # Archivo interno
+        internal = project_root / "1. Material" / "clip.mov"
+        dest = _compute_dest_path(internal, project_root, project_folder, media_folder)
+        check_true("interno: dentro de project_folder",
+                    str(dest).startswith(str(project_folder)))
+        check_true("interno: prefijo numerico limpiado",
+                    "1. Material" not in str(dest))
+        check_true("interno: nombre Material preservado",
+                    "Material" in str(dest))
+
+        # Archivo externo
+        external = Path("Z:/Other/Drive/clip.mov")
+        dest_ext = _compute_dest_path(external, project_root, project_folder, media_folder)
+        check_true("externo: dentro de Otros/",
+                    str(dest_ext).startswith(str(media_folder)))
 
 
 # =====================================================================
@@ -1681,6 +2017,7 @@ if __name__ == "__main__":
     test_translate_path()
     test_media_dest_path()
     test_clean_folder_name()
+    test_infer_volume_mappings()
     test_unique_folder_name()
     test_is_auto_nested_name()
     test_fmt_size()
@@ -1721,6 +2058,24 @@ if __name__ == "__main__":
     test_scan_aep_empty()
     test_scan_aep_nonexistent()
     test_expand_ae_dependencies()
+
+    # 5b. Scanner estructural, validacion, rewrite .aepx
+    test_scan_aep_alas_paths()
+    test_scan_aep_alas_paths_empty()
+    test_scan_aep_alas_paths_not_rifx()
+    test_scan_aep_alas_paths_nested_list()
+    test_scan_aep_alas_invalid_json()
+    test_scan_aep_for_footage_uses_structural()
+    test_validate_rifx_valid()
+    test_validate_rifx_bad_magic()
+    test_validate_rifx_truncated()
+    test_validate_rifx_size_mismatch()
+    test_rewrite_aep_paths_with_validation()
+    test_rewrite_aepx_paths()
+    test_rewrite_aepx_paths_gzipped()
+    test_rewrite_aepx_no_match()
+    test_maybe_rewrite_alas_payload_variants()
+    test_compute_dest_path()
 
     # 6. Read/Write
     test_read_write_prproj()
